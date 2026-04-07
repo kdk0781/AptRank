@@ -144,8 +144,6 @@ let _aFO = false; // 즐겨찾기만 보기 토글
 const _RK = 'apt_map_recent';
 const _RM = 5;
 let _rS = []; // string[]
-const _sUR = '_shr_user_recent'; // 수신자 최근검색 (localStorage 영구)
-const _sUF = '_shr_user_favs'; // 수신자 즐겨찾기 (localStorage 영구)
 const _sM = {
 'T':'테라스','P':'펜트','C':'코너',
 'A':'타입A','B':'타입B','D':'타입D','E':'타입E',
@@ -233,8 +231,6 @@ const savedCurr = localStorage.getItem(_cC);
 const savedPrev = localStorage.getItem(_cP);
 const savedFavs = localStorage.getItem(_FK);
 const savedRecent = localStorage.getItem(_RK);
-const savedShrUserRc = localStorage.getItem(_sUR); // 수신자 검색어 영구
-const savedShrUserFavs = localStorage.getItem(_sUF); // 수신자 즐겨찾기 영구
 const isShareSess = !!sessionStorage.getItem('_shr_t');
 const savedShrLs = isShareSess ? localStorage.getItem('_shr_ls') : null;
 const savedShrExp = localStorage.getItem('_shr_exp');
@@ -243,8 +239,6 @@ if (savedCurr) localStorage.setItem(_cC, savedCurr);
 if (savedPrev) localStorage.setItem(_cP, savedPrev);
 if (savedFavs) localStorage.setItem(_FK, savedFavs);
 if (savedRecent) localStorage.setItem(_RK, savedRecent);
-if (savedShrUserRc) localStorage.setItem(_sUR, savedShrUserRc);
-if (savedShrUserFavs) localStorage.setItem(_sUF, savedShrUserFavs);
 if (savedShrLs) localStorage.setItem('_shr_ls', savedShrLs);
 if (savedShrExp) localStorage.setItem('_shr_exp', savedShrExp);
 const ssToken = sessionStorage.getItem('_shr_t');
@@ -252,12 +246,14 @@ const ssUrl = sessionStorage.getItem('_shr_u');
 const ssBlocked = sessionStorage.getItem('_shr_blocked');
 const ssAlive = sessionStorage.getItem('_shr_sess_alive');
 const ssRecent = sessionStorage.getItem('_shr_recent'); // 수신자 최근검색
+const ssRcClr = sessionStorage.getItem('_shr_rc_cleared'); // 첫접속 판단 플래그
 sessionStorage.clear();
 if (ssToken) sessionStorage.setItem('_shr_t', ssToken);
 if (ssUrl) sessionStorage.setItem('_shr_u', ssUrl);
-if (ssBlocked) sessionStorage.setItem('_shr_blocked', ssBlocked);
+if (ssBlocked)sessionStorage.setItem('_shr_blocked', ssBlocked);
 if (ssAlive) sessionStorage.setItem('_shr_sess_alive', ssAlive);
 if (ssRecent) sessionStorage.setItem('_shr_recent', ssRecent);
+if (ssRcClr) sessionStorage.setItem('_shr_rc_cleared', ssRcClr);
 } finally { window.location.reload(true); }
 });
 document.getElementById('listBody').addEventListener('click', (e)=>{
@@ -329,40 +325,21 @@ _sSO();
 _sSTB();
 _sSB();
 _lFav();
-if (navigator.storage&&navigator.storage.persist) {
-navigator.storage.persist().catch(()=>{});
-}
 const _isShareRecv = !!window._isShareRecipient;
 if (_isShareRecv) {
 const _rcCleared = sessionStorage.getItem('_shr_rc_cleared');
 if (!_rcCleared) {
-try {
-const savedRecent = localStorage.getItem(_sUR);
-_rS = savedRecent ? JSON.parse(savedRecent) : [];
-} catch { _rS = []; }
-if (window._shareIncludeFavs) {
-try {
-const savedFavs = localStorage.getItem(_sUF);
-if (savedFavs) _fS = new Set(JSON.parse(savedFavs));
-} catch {}
-} else {
-_fS = new Set();
-}
+_rS = [];
+sessionStorage.setItem('_shr_recent', '[]');
 sessionStorage.setItem('_shr_rc_cleared', '1');
-sessionStorage.setItem('_shr_recent', JSON.stringify(_rS));
 } else {
 try {
 const raw = sessionStorage.getItem('_shr_recent');
 _rS = raw ? JSON.parse(raw) : [];
 } catch { _rS = []; }
-if (window._shareIncludeFavs) {
-try {
-const savedFavs = localStorage.getItem(_sUF);
-if (savedFavs) _fS = new Set(JSON.parse(savedFavs));
-} catch {}
-} else {
-_fS = new Set();
 }
+if (!window._shareIncludeFavs) {
+_fS = new Set();
 }
 _rRSU();
 } else {
@@ -973,9 +950,6 @@ _fS = new Set(raw ? JSON.parse(raw) : []);
 }
 function _sFav() {
 try { localStorage.setItem(_FK, JSON.stringify([..._fS])); } catch {}
-if (window._isShareRecipient&&window._shareIncludeFavs) {
-try { localStorage.setItem(_sUF, JSON.stringify([..._fS])); } catch {}
-}
 }
 function _lRS() {
 try {
@@ -991,7 +965,6 @@ _rS.unshift(term);
 if (_rS.length > _RM) _rS = _rS.slice(0, _RM);
 if (window._isShareRecipient) {
 try { sessionStorage.setItem('_shr_recent', JSON.stringify(_rS)); } catch {}
-try { localStorage.setItem(_sUR, JSON.stringify(_rS)); } catch {}
 } else {
 try { localStorage.setItem(_RK, JSON.stringify(_rS)); } catch {}
 }
@@ -1001,7 +974,6 @@ function _rRS(term) {
 _rS = _rS.filter(t=>t!==term);
 if (window._isShareRecipient) {
 try { sessionStorage.setItem('_shr_recent', JSON.stringify(_rS)); } catch {}
-try { localStorage.setItem(_sUR, JSON.stringify(_rS)); } catch {}
 } else {
 try { localStorage.setItem(_RK, JSON.stringify(_rS)); } catch {}
 }
