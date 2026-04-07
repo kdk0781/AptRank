@@ -98,7 +98,12 @@ window._isShareRecipient = true;
 window._shareIncludeFavs = !!decoded.includeFavs;
 return true;
 }
-try { history.replaceState(null, '', location.pathname); } catch (_) {}
+try {
+const _dir = location.pathname.replace(/\/[^/]*$/, '/'); // /test/index.html → /test/
+const _rnd = Math.random().toString(36).slice(2, 10)
++ Math.random().toString(36).slice(2, 10);
+history.replaceState(null, '', _dir + '#' + _rnd);
+} catch (_) {}
 try {
 sessionStorage.removeItem(SS_TOKEN);
 sessionStorage.removeItem(SS_URL);
