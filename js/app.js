@@ -1,7 +1,7 @@
 const _V = 'v9.0';
 const _SEM = {
 icon: '🔒',
-title: '트랙픽이 초과가 되었습니다',
+title: '링크가 만료되었습니다',
 desc: '접속량이 많아 유효한 페이지가 아닙니다.',
 sub: '담당자분께 링크를 다시 요청하세요.',
 };
@@ -11,7 +11,7 @@ const _CNS = 'kdk-apt-map'; // ← 변경 가능 (다른 사이트와 충돌 방
 const _SCT = (url) =>
 `[KB 아파트 시세표]
 아래 링크를 클릭하면 주간 시세를 확인하실 수 있습니다.
-실시간 수도권지역 아파트 시세를 확인하실 수 있습니다.
+유효 기간이 있는 임시 링크이며, 기간 만료 시 접속이 제한됩니다.
 ${url}`;
 function _sE(payload) {
 const key = _SS;
@@ -385,9 +385,7 @@ if (window._showSharePreview) {
 showSharePreview();
 return; // _lD는 startApp()에서 호출
 }
-if (!window._isShareRecipient) {
-_tTV();
-}
+_tTV(!!window._isShareRecipient);
 _lD();
 });
 function _sSP() {
@@ -950,7 +948,7 @@ splash.style.opacity = '1';
 splash.style.visibility = 'visible';
 splash.innerHTML = `
 <div class="share-preview-page">
-<p class="spp-badge">시세표 링크</p>
+<p class="spp-badge">임시 공유 링크</p>
 <div class="spp-icon">📊</div>
 <h2 class="spp-title">아파트 시세표</h2>
 <p class="spp-desc">
@@ -959,7 +957,7 @@ Preview를 클릭하거나<br>
 자동으로 이동됩니다.
 </p>
 <button id="sharePreviewBtn" class="spp-btn">Preview →</button>
-<p class="spp-notice">🏠 수도권 아파트시세 링크입니다.</p>
+<p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
 </div>`;
 let started = false;
 const go = ()=>{
@@ -1061,18 +1059,22 @@ const m = String(d.getMonth() + 1).padStart(2, '0');
 const day = String(d.getDate()).padStart(2, '0');
 return 'd-' + y + m + day; // 예: d-20260408
 }
-async function _tTV() {
-const key = _gTK();
-const lsKey = '_today_hit_' + key;
-if (localStorage.getItem(lsKey)) return; // 이미 카운트됨
+async function _tTV(isRecipient) {
+const dateKey = _gTK();
+const apiKey = isRecipient
+? 's-' + dateKey.slice(2) // s-YYYYMMDD (공유)
+: dateKey; // d-YYYYMMDD (직접)
+const dupKey = '_today_hit_' + apiKey;
+const storage = isRecipient ? sessionStorage : localStorage;
+if (storage.getItem(dupKey)) return;
 try {
 await fetch(
-`https://api.counterapi.dev/v1/${_CNS}/${key}/up`,
-{ method: 'GET' } // counterapi.dev는 GET으로 증가
+`https://api.counterapi.dev/v1/${_CNS}/${apiKey}/up`,
+{ method: 'GET' }
 );
-localStorage.setItem(lsKey, '1');
-_cOHK();
-} catch (_) {} // API 실패 시 조용히 무시
+storage.setItem(dupKey, '1');
+if (!isRecipient) _cOHK();
+} catch (_) {}
 }
 function _cOHK() {
 const cutoff = new Date();
@@ -1098,8 +1100,21 @@ popup.innerHTML = `
 <button class="tp-close" onclick="document.getElementById('todayPopup')?.remove()">✕</button>
 </div>
 <div class="tp-body">
-<div class="tp-count" id="tpCount">
-<div class="tp-spinner"></div>
+<div class="tp-rows">
+<div class="tp-row">
+<span class="tp-label">🏠 직접 접속</span>
+<span class="tp-val" id="tpDirect"><span class="tp-spinner-sm"></span></span>
+</div>
+<div class="tp-divider"></div>
+<div class="tp-row">
+<span class="tp-label">🔗 공유 링크</span>
+<span class="tp-val" id="tpShare"><span class="tp-spinner-sm"></span></span>
+</div>
+<div class="tp-divider"></div>
+<div class="tp-row tp-row-total">
+<span class="tp-label">합계</span>
+<span class="tp-val tp-total" id="tpTotal">-</span>
+</div>
 </div>
 <p class="tp-date">${new Date().toLocaleDateString('ko-KR')} 기준</p>
 <p class="tp-hint">같은 브라우저 당일 중복 집계 제외</p>
@@ -1113,19 +1128,30 @@ document.removeEventListener('click', _close);
 }
 });
 }, 200);
+const dateKey = _gTK();
+const directKey = dateKey; // d-YYYYMMDD
+const shareKey = 's-' + dateKey.slice(2); // s-YYYYMMDD
+const fetchCount = async (key)=>{
 try {
-const key = _gTK();
-const res = await fetch(
-`https://api.counterapi.dev/v1/${_CNS}/${key}/get`
-);
+const res = await fetch(`https://api.counterapi.dev/v1/${_CNS}/${key}/get`);
 const data = await res.json();
-const count = data?.value ?? data?.count ?? 0;
-const el = document.getElementById('tpCount');
-if (el) {
-el.innerHTML = `<span class="tp-num">${count.toLocaleString('ko-KR')}</span><span class="tp-unit">명</span>`;
-}
-} catch (_) {
-const el = document.getElementById('tpCount');
-if (el) el.innerHTML = '<span class="tp-err">집계 불가</span>';
+return data?.value ?? data?.count ?? 0;
+} catch (_) { return null; }
+};
+const fmt = (n)=>n===null
+? '<span class="tp-err">-</span>'
+: `<span class="tp-num-sm">${Number(n).toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
+const [direct, share] = await Promise.all([
+fetchCount(directKey),
+fetchCount(shareKey),
+]);
+const elD = document.getElementById('tpDirect');
+const elS = document.getElementById('tpShare');
+const elT = document.getElementById('tpTotal');
+if (elD) elD.innerHTML = fmt(direct);
+if (elS) elS.innerHTML = fmt(share);
+if (elT) {
+const total = (direct ?? 0) + (share ?? 0);
+elT.innerHTML = `<span class="tp-num-sm tp-total-num">${total.toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
 }
 }
