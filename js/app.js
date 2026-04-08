@@ -1,7 +1,7 @@
 const _V = 'v9.0';
 const _SEM = {
 icon: '🔒',
-title: '링크가 만료되었습니다',
+title: '트랙픽이 초과가 되었습니다',
 desc: '접속량이 많아 유효한 페이지가 아닙니다.',
 sub: '담당자분께 링크를 다시 요청하세요.',
 };
@@ -11,7 +11,7 @@ const _CNS = 'kdk-apt-map'; // ← 변경 가능 (다른 사이트와 충돌 방
 const _SCT = (url) =>
 `[KB 아파트 시세표]
 아래 링크를 클릭하면 주간 시세를 확인하실 수 있습니다.
-유효 기간이 있는 임시 링크이며, 기간 만료 시 접속이 제한됩니다.
+실시간 수도권지역 아파트 시세를 확인하실 수 있습니다.
 ${url}`;
 function _sE(payload) {
 const key = _SS;
@@ -950,7 +950,7 @@ splash.style.opacity = '1';
 splash.style.visibility = 'visible';
 splash.innerHTML = `
 <div class="share-preview-page">
-<p class="spp-badge">임시 공유 링크</p>
+<p class="spp-badge">시세표 링크</p>
 <div class="spp-icon">📊</div>
 <h2 class="spp-title">아파트 시세표</h2>
 <p class="spp-desc">
@@ -959,7 +959,7 @@ Preview를 클릭하거나<br>
 자동으로 이동됩니다.
 </p>
 <button id="sharePreviewBtn" class="spp-btn">Preview →</button>
-<p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
+<p class="spp-notice">🏠 수도권 아파트시세 링크입니다.</p>
 </div>`;
 let started = false;
 const go = ()=>{
