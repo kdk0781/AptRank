@@ -1,8 +1,8 @@
 const _V = 'v9.0';
 const _SEM = {
 icon: '🔒',
-title: '트래픽이 초과 되었습니다',
-desc: '트랙픽 초과로 페이지 접속이 불가합니다..',
+title: '링크가 만료되었습니다',
+desc: '접속량이 많아 유효한 페이지가 아닙니다.',
 sub: '담당자분께 링크를 다시 요청하세요.',
 };
 const _SS = 'kdk_apt_2026_!@#'; // ← 원하는 값으로 변경
@@ -10,8 +10,8 @@ const _SP = 'k';
 const _CNS = 'kdk-apt-map'; // ← 변경 가능 (다른 사이트와 충돌 방지용)
 const _SCT = (url) =>
 `[KB 아파트 시세표]
-아래 링크를 클릭하면 주간 시세 및 
-실시간 수도권 아파트 시세를 확인할실 수 있습니다.
+아래 링크를 클릭하면 주간 시세를 확인하실 수 있습니다.
+유효 기간이 있는 임시 링크이며, 기간 만료 시 접속이 제한됩니다.
 ${url}`;
 function _sE(payload) {
 const key = _SS;
@@ -150,6 +150,7 @@ let _sO = null;
 const _FK = 'apt_map_favs';
 let _fS = new Set(); // Set<string> key = 지역|아파트
 let _aFO = false; // 즐겨찾기만 보기 토글
+let _aFH = false; // 생애최초 LTV 모드
 const _RK = 'apt_map_recent';
 const _RM = 5;
 let _rS = []; // string[]
@@ -187,8 +188,14 @@ return { zone: null, label: '' };
 function _gLL(priceRaw, regZone, midRaw) {
 if (!priceRaw||priceRaw<=0) return null;
 const isReg = regZone==='A'||regZone==='B';
-const ltvRate = isReg ? 0.40 : 0.70;
-const ltvPct = isReg ? 40 : 70;
+let ltvRate, ltvPct;
+if (_aFH&&isReg) {
+ltvRate = 0.70;
+ltvPct = 70;
+} else {
+ltvRate = isReg ? 0.40 : 0.70;
+ltvPct = isReg ? 40 : 70;
+}
 const ltvAmt = Math.floor(priceRaw * ltvRate / 100) * 100;
 const ref = midRaw||priceRaw;
 let policyLimit;
@@ -208,7 +215,9 @@ return `${rest.toLocaleString('ko-KR')}만`;
 }
 const amtStr = fmtAmt(finalAmt);
 let cls;
-if (isLtvLimit) {
+if (_aFH&&isReg) {
+cls = 'loan-first-home'; // 생애최초 규제지역 전용 색상
+} else if (isLtvLimit) {
 cls = isReg ? 'loan-ltv-reg' : 'loan-ltv-gen';
 } else {
 if (policyLimit===60000) cls = 'loan-pol-a';
@@ -340,6 +349,13 @@ document.body.classList.toggle('pyeong-mode', _aU==='pyeong');
 const btn = document.getElementById('unitToggleBtn');
 btn.querySelector('.u-label-sqm').classList.toggle('active', _aU==='sqm');
 btn.querySelector('.u-label-pyeong').classList.toggle('active', _aU==='pyeong');
+});
+document.getElementById('firstHomeBtn')?.addEventListener('click', ()=>{
+_aFH = !_aFH;
+const btn = document.getElementById('firstHomeBtn');
+btn.classList.toggle('active', _aFH);
+btn.title = _aFH ? '생애최초 LTV 해제' : '생애최초 LTV 적용';
+_rI();
 });
 _sSO();
 _sSTB();
@@ -671,8 +687,10 @@ return diff > 0
 }
 function _cGH(g) {
 const priceRange = _gPR(g);
-const ltvPct = (g.regZone==='A'||g.regZone==='B') ? 40 : 70;
-const ltvChip = `<span class="ltv-chip ltv-${ltvPct}">LTV ${ltvPct}%</span>`;
+const isRegCard = g.regZone==='A'||g.regZone==='B';
+const ltvPct = (isRegCard&&!_aFH) ? 40 : 70;
+const ltvChipCls = (isRegCard&&_aFH) ? 'ltv-chip ltv-70 ltv-first' : `ltv-chip ltv-${ltvPct}`;
+const ltvChip = `<span class="${ltvChipCls}">LTV ${ltvPct}%${_aFH&&isRegCard ? ' <em class="ltv-fh-mark">생애최초</em>' : ''}</span>`;
 const regBadge = g.regLabel
 ? `<div class="reg-badges">
 <span class="reg-badge reg-${g.regZone}">${g.regLabel}</span>
@@ -932,7 +950,7 @@ splash.style.opacity = '1';
 splash.style.visibility = 'visible';
 splash.innerHTML = `
 <div class="share-preview-page">
-<p class="spp-badge">수도권 아파트 시세 링크</p>
+<p class="spp-badge">임시 공유 링크</p>
 <div class="spp-icon">📊</div>
 <h2 class="spp-title">아파트 시세표</h2>
 <p class="spp-desc">
@@ -941,7 +959,7 @@ Preview를 클릭하거나<br>
 자동으로 이동됩니다.
 </p>
 <button id="sharePreviewBtn" class="spp-btn">Preview →</button>
-<p class="spp-notice">🏠 매주 실시간으로 수도권 시세 확인가능한 링크 입니다.</p>
+<p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
 </div>`;
 let started = false;
 const go = ()=>{
