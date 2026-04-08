@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
-    <link rel="stylesheet" href="css/common.css?v=74">
+    <link rel="stylesheet" href="css/common.css?v=76">
 </head>
 <body>
 
@@ -78,31 +78,30 @@
         <!-- 지역 칩 필터 (파싱 후 동적 생성) -->
         <div id="regionFilter" class="region-filter"></div>
 
-        <!-- 결과 수 + 단위 토글 + 정렬 -->
+        <!-- 결과 수 + 단위 토글 + 생애최초 -->
         <div class="meta-row">
             <span id="resultCount" class="result-count"></span>
             <div style="display:flex; align-items:center; gap:8px;">
-                <!-- ㎡ / 평 단위 토글 -->
                 <button id="unitToggleBtn" class="unit-toggle-btn" title="면적 단위 전환">
                     <span class="u-label-sqm active">㎡</span>
                     <span class="u-sep"></span>
                     <span class="u-label-pyeong">평</span>
                 </button>
-                <select id="sortSelect" class="sort-select">
-                    <option value="default">기본순</option>
-                    <option value="name">가나다순</option>
-                    <option value="price_asc">가격 낮은순</option>
-                    <option value="price_desc">가격 높은순</option>
-                </select>
+                <button id="firstHomeBtn" class="first-home-btn" title="생애최초 LTV 적용">
+                    🏠 생애최초
+                </button>
             </div>
         </div>
 
-        <!-- 기준일(좌) + 생애최초 버튼(우) -->
+        <!-- 정렬 셀렉트 + 기준일 -->
         <div class="date-action-row">
             <div id="baseDateLabel" class="base-date-label"></div>
-            <button id="firstHomeBtn" class="first-home-btn" title="생애최초 LTV 적용">
-                🏠 생애최초
-            </button>
+            <select id="sortSelect" class="sort-select">
+                <option value="default">기본순</option>
+                <option value="name">가나다순</option>
+                <option value="price_asc">가격 낮은순</option>
+                <option value="price_desc">가격 높은순</option>
+            </select>
         </div>
 
     </div><!-- /.sticky-header -->
@@ -194,6 +193,6 @@
     </div>
 </div>
 
-<script src="js/app.js?v=74"></script>
+<script src="js/app.js?v=76"></script>
 </body>
 </html>
