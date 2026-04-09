@@ -1217,6 +1217,7 @@ body.pyeong-mode .u-sqm    { display: none !important; }
     border-radius: 12px;
     margin-bottom: 16px;
     gap: 12px;
+	display:none;
 }
 .share-fav-toggle-info {
     display: flex;
