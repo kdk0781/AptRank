@@ -1,18 +1,20 @@
 const _V = 'v9.0';
 const _SEM = {
 icon: '🔒',
-title: '트래픽 초과로 만료되었습니다.',
+title: '링크가 만료되었습니다',
 desc: '접속량이 많아 유효한 페이지가 아닙니다.',
 sub: '담당자분께 링크를 다시 요청하세요.',
 };
 const _SS = 'kdk_apt_2026_!@#'; // ← 원하는 값으로 변경
 const _SP = 'k';
-const _CNS = 'kdk-apt-map'; // ← 변경 가능 (다른 사이트와 충돌 방지용)
+const _FBU = 'https://counting-526f5-default-rtdb.asia-southeast1.firebasedatabase.app'; // Firebase Realtime Database URL
+const _CNS = 'apt-map'; // Firebase 경로 prefix
 const PUSH_WORKER_URL = ''; // ← Cloudflare Worker URL (예: https://push.yourname.workers.dev)
 const PUSH_ADMIN_KEY = ''; // ← ADMIN_KEY (Worker 환경변수와 동일한 값)
 const _SCT = (url) =>
 `[KB 아파트 시세표]
-아래 링크를 클릭하면 수도권 주간 아파트 시세를 확인하실 수 있습니다.
+아래 링크를 클릭하면 주간 시세를 확인하실 수 있습니다.
+유효 기간이 있는 임시 링크이며, 기간 만료 시 접속이 제한됩니다.
 ${url}`;
 function _sE(payload) {
 const key = _SS;
@@ -348,6 +350,7 @@ const v = _si.value.trim();
 if (v==='투데이') {
 e.preventDefault();
 _si.value = '';
+_si.blur(); // 키보드 닫기
 _rRSU();
 _sTVP();
 return;
@@ -355,6 +358,7 @@ return;
 if (v==='알림전송') {
 e.preventDefault();
 _si.value = '';
+_si.blur();
 _rRSU();
 showPushAdminPanel();
 return;
@@ -362,11 +366,13 @@ return;
 if (v==='알림구독') {
 e.preventDefault();
 _si.value = '';
+_si.blur();
 _rRSU();
 requestPushPermission();
 return;
 }
 _saveSearchTerm();
+_si.blur();
 _rRSU();
 }
 });
@@ -1008,7 +1014,7 @@ Preview를 클릭하거나<br>
 자동으로 이동됩니다.
 </p>
 <button id="sharePreviewBtn" class="spp-btn">Preview →</button>
-<p class="spp-notice">🏠수도권 아파트 시세</p>
+<p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
 </div>`;
 let started = false;
 const go = ()=>{
@@ -1111,17 +1117,21 @@ const day = String(d.getDate()).padStart(2, '0');
 return 'd-' + y + m + day; // 예: d-20260408
 }
 async function _tTV(isRecipient) {
+if (!_FBU) return; // Firebase URL 미설정 시 스킵
 const dateKey = _gTK();
-const apiKey = isRecipient
-? 's-' + dateKey.slice(2) // s-YYYYMMDD (공유)
-: dateKey; // d-YYYYMMDD (직접)
+const apiKey = isRecipient ? 's-' + dateKey.slice(2) : dateKey;
 const dupKey = '_today_hit_' + apiKey;
 const storage = isRecipient ? sessionStorage : localStorage;
 if (storage.getItem(dupKey)) return;
 try {
-const res = await fetch(
-`https://api.countapi.xyz/hit/${_CNS}/${apiKey}`
-);
+const path = `${_FBU}/${_CNS}/${apiKey}.json`;
+const cur = await fetch(path).then(r=>r.json()).catch(()=>0);
+const next = (typeof cur==='number' ? cur : 0) + 1;
+const res = await fetch(path, {
+method: 'PUT',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify(next),
+});
 if (res.ok) {
 storage.setItem(dupKey, '1');
 if (!isRecipient) _cOHK();
@@ -1183,11 +1193,20 @@ document.removeEventListener('click', _close);
 const dateKey = _gTK();
 const directKey = dateKey; // d-YYYYMMDD
 const shareKey = 's-' + dateKey.slice(2); // s-YYYYMMDD
+if (!_FBU) {
+const elD = document.getElementById('tpDirect');
+const elS = document.getElementById('tpShare');
+const elT = document.getElementById('tpTotal');
+if (elD) elD.innerHTML = '<span class="tp-err">설정 필요</span>';
+if (elS) elS.innerHTML = '<span class="tp-err">설정 필요</span>';
+if (elT) elT.innerHTML = '<span class="tp-err" style="font-size:0.7rem">_FBU을 설정하세요</span>';
+return;
+}
 const fetchCount = async (key)=>{
 try {
-const res = await fetch(`https://api.countapi.xyz/get/${_CNS}/${key}`);
-const data = await res.json();
-return data?.value ?? 0;
+const res = await fetch(`${_FBU}/${_CNS}/${key}.json`);
+const val = await res.json();
+return typeof val==='number' ? val : 0;
 } catch (_) { return null; }
 };
 const fmt = (n)=>n===null
