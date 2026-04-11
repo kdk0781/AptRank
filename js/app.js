@@ -392,11 +392,40 @@ btn.querySelector('.u-label-sqm').classList.toggle('active', _aU==='sqm');
 btn.querySelector('.u-label-pyeong').classList.toggle('active', _aU==='pyeong');
 });
 document.getElementById('firstHomeBtn')?.addEventListener('click', ()=>{
+const _hdrBottom = (document.querySelector('.sticky-header')?.getBoundingClientRect().bottom ?? 0);
+const _allItems = [...document.querySelectorAll('#listBody .group-item')];
+const _openItem = document.querySelector('#listBody .group-item.active');
+let _anchorIdx = -1;
+if (_openItem) {
+_anchorIdx = _allItems.indexOf(_openItem);
+} else {
+for (let i = 0; i < _allItems.length; i++) {
+if (_allItems[i].getBoundingClientRect().bottom > _hdrBottom + 2) {
+_anchorIdx = i; break;
+}
+}
+}
 _aFH = !_aFH;
 const btn = document.getElementById('firstHomeBtn');
 btn.classList.toggle('active', _aFH);
 btn.title = _aFH ? '생애최초 LTV 해제' : '생애최초 LTV 적용';
 _rI(true);
+if (_anchorIdx>=0) {
+requestAnimationFrame(()=>{
+requestAnimationFrame(()=>{
+const _target = document.querySelectorAll('#listBody .group-item')[_anchorIdx];
+if (_target) {
+const _hdr = document.querySelector('.sticky-header');
+const _hBottom = _hdr ? _hdr.getBoundingClientRect().bottom : 0;
+const _rect = _target.getBoundingClientRect();
+window.scrollTo({
+top: window.scrollY + _rect.top - _hBottom - 4,
+behavior: 'instant'
+});
+}
+});
+});
+}
 });
 _sSO();
 _sSTB();
@@ -883,8 +912,14 @@ listBody.innerHTML = `<div class="empty-state"><span class="empty-icon">🔍</sp
 sentinel.style.display = 'none';
 return;
 }
+if (keepScroll) {
+const _estCount = Math.ceil((window.scrollY + window.innerHeight * 2) / 100) + _lS;
+const _need = Math.min(_estCount, _fG.length);
+while (_lC < _need) _lM();
+} else {
 _lM();
-if (!keepScroll) window.scrollTo({ top: 0, behavior: 'smooth' });
+window.scrollTo({ top: 0, behavior: 'smooth' });
+}
 }
 function _lM() {
 const listBody = document.getElementById('listBody');
