@@ -1,1495 +1,2503 @@
-const _V = 'v9.0';
-const _SEM = {
-icon: '🔒',
-title: '링크가 만료되었습니다',
-desc: '접속량이 많아 유효한 페이지가 아닙니다.',
-sub: '담당자분께 링크를 다시 요청하세요.',
+/* ════════════════════════════════════════════
+   아파트 시세표 | app_src.js  v10.0  (2026-04-15)
+   ────────────────────────────────────────────
+   ✅ 상태기계 CSV 파서 (O(n), 재앙적 정규식 제거)
+   ✅ 동기 파싱 38ms — async 청크 구조 완전 제거
+   ✅ 스플래시 3중 보장 (정상/오류/5초 타이머)
+   ✅ 버전 번호 화면 표시 (배포 확인용)
+   ✅ 맨위로 버튼 (300px 이상 스크롤 시 표시)
+   ✅ 지난주 대비 가격 변동 표시 (curr/prev 두 슬롯)
+   ✅ 일반가 기준 대출 가능 한도 표시
+   ✅ CSV fetch cache: no-store (캐시 우회)
+   ──────────────────────────────────
+   🆕 v10 변경사항 (2026-04-15)
+   🆕 관리자 모드 게이트 — 검색창 "관리자" 입력으로 활성화
+      비관리자는 공유 버튼 클릭 시 현재 URL만 복사 (모달 노출 안 됨)
+      → 삼성 인터넷에서 모달 노출 버그 근본 해결
+   🆕 PWA 설치 권한 토글 — 공유 토큰에 allowPwa 포함
+      허용 시 수신자가 홈화면 설치 가능 + 최초 접속 시 설치 안내 카드
+   🆕 공유 수신자 CSV 업데이트 폴링 — SW 없는 수신자도 갱신 인지
+   🆕 PWA 설치자 Periodic Sync — 백그라운드 CSV 변경 감지 시 푸시
+   🆕 관리자 ‘배지/지속 표시’ + 검색창 "관리자해제"로 비활성화
+════════════════════════════════════════════ */
+
+const APP_VERSION = 'v10.0';
+
+/* ════════════════════════════════════════════
+   관리자 모드 설정
+   ────────────────────────────────────────────
+   ADMIN_PASSPHRASE        : 검색창에 입력하면 관리자 활성화
+   ADMIN_PASSPHRASE_OFF    : 검색창에 입력하면 관리자 해제
+   ADMIN_LS_KEY            : localStorage 저장 키
+   ADMIN_SECRET            : 무결성 서명용 (단순 변조 방지)
+
+   동작:
+   - 관리자 모드 ON  → 공유 버튼 클릭 시 풀 모달 (기간/즐겨찾기/PWA 토글)
+   - 관리자 모드 OFF → 공유 버튼 클릭 시 현재 URL만 클립보드 복사
+   - 공유 수신자(?k=토큰)는 위 둘과 무관하게 항상 받은 링크 복사
+════════════════════════════════════════════ */
+const ADMIN_PASSPHRASE     = '관리자';
+const ADMIN_PASSPHRASE_OFF = '관리자해제';
+const ADMIN_LS_KEY         = '_apt_admin_v1';
+const ADMIN_SECRET         = 'kdk_apt_admin_2026';
+
+/* 단순 무결성 서명 — 사용자가 localStorage 값을 임의로 추측해 위조하기 어렵게 함
+   진짜 보안 목적은 아니며, 우발적 켜짐 방지용 */
+function _adminSig(payload) {
+    let h = 0x811c9dc5;
+    const s = payload + '|' + ADMIN_SECRET;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(36);
+}
+
+function isAdmin() {
+    try {
+        const raw = localStorage.getItem(ADMIN_LS_KEY);
+        if (!raw) return false;
+        const obj = JSON.parse(raw);
+        if (!obj || obj.v !== 1 || !obj.t) return false;
+        return _adminSig(String(obj.t)) === obj.s;
+    } catch { return false; }
+}
+
+function setAdmin(on) {
+    try {
+        if (on) {
+            const t = Date.now();
+            localStorage.setItem(ADMIN_LS_KEY,
+                JSON.stringify({ v: 1, t, s: _adminSig(String(t)) }));
+        } else {
+            localStorage.removeItem(ADMIN_LS_KEY);
+        }
+    } catch {}
+}
+
+/* ════════════════════════════════════════════
+   임시 공유 링크 만료 메시지 설정
+   ────────────────────────────────────────────
+   아래 텍스트를 수정하면 만료 페이지 문구가 바뀝니다.
+════════════════════════════════════════════ */
+const SHARE_EXPIRED_MSG = {
+    icon:  '🔒',
+    title: '링크가 만료되었습니다',
+    desc:  '접속량이 많아 유효한 페이지가 아닙니다.',
+    sub:   '담당자분께 링크를 다시 요청하세요.',
 };
-const _SS = 'kdk_apt_2026_!@#'; // ← 원하는 값으로 변경
-const _SP = 'k';
-const _FBU = 'https://counting-526f5-default-rtdb.asia-southeast1.firebasedatabase.app'; // Firebase Realtime Database URL
-const _CNS = 'apt-map'; // Firebase 경로 prefix
+
+/* ════════════════════════════════════════════
+   공유 토큰 암호화 설정
+   ────────────────────────────────────────────
+   SHARE_SECRET : 암복호화 비밀키 (자유롭게 변경 가능)
+   SHARE_PARAM  : URL 파라미터명 (기본 'k' — 짧고 의미 없음)
+
+   암호화 방식: XOR cipher + URL-safe Base64
+   → base64 디코딩해도 XOR 없이 해독 불가
+   → 토큰에서 만료 시각 추측 불가
+════════════════════════════════════════════ */
+const SHARE_SECRET = 'kdk_apt_2026_!@#'; // ← 원하는 값으로 변경
+const SHARE_PARAM  = 'k';
+
+/* ════════════════════════════════════════════
+   투데이 방문자 카운터 설정
+   ────────────────────────────────────────────
+   FIREBASE_URL : Firebase Realtime Database URL
+     예) 'https://my-project-default-rtdb.firebaseio.com'
+     설정 방법: console.firebase.google.com → 프로젝트 생성
+               → Realtime Database → 테스트 모드로 시작
+               → 데이터베이스 URL 복사 후 아래 붙여넣기
+   검색창에 "투데이" 입력 + Enter → 오늘 방문자 수 팝업
+════════════════════════════════════════════ */
+const FIREBASE_URL = 'https://counting-526f5-default-rtdb.asia-southeast1.firebasedatabase.app'; // Firebase Realtime Database URL
+const COUNT_NS     = 'apt-map'; // Firebase 경로 prefix
+
+/* ════════════════════════════════════════════
+   Web Push 설정
+   ────────────────────────────────────────────
+   1. push-worker.js 를 Cloudflare Workers 에 배포
+   2. KV Namespace 'SUBS' 생성 후 Worker에 바인딩
+   3. 환경변수 설정 후 아래 PUSH_WORKER_URL 입력
+════════════════════════════════════════════ */
 const PUSH_WORKER_URL = ''; // ← Cloudflare Worker URL (예: https://push.yourname.workers.dev)
-const PUSH_ADMIN_KEY = ''; // ← ADMIN_KEY (Worker 환경변수와 동일한 값)
-const _SCT = (url) =>
+const PUSH_ADMIN_KEY  = ''; // ← ADMIN_KEY (Worker 환경변수와 동일한 값)
+
+/* ════════════════════════════════════════════
+   카카오톡/문자 공유용 메시지 템플릿
+   ────────────────────────────────────────────
+   복사 버튼 클릭 시 이 형식으로 클립보드에 저장됩니다.
+   ${url} 자리에 단축 링크가 자동 삽입됩니다.
+   ▶ 문구를 원하는 대로 수정하세요.
+════════════════════════════════════════════ */
+const SHARE_COPY_TEMPLATE = (url) =>
 `[KB 아파트 시세표]
 아래 링크를 클릭하면 주간 시세를 확인하실 수 있습니다.
 유효 기간이 있는 임시 링크이며, 기간 만료 시 접속이 제한됩니다.
 ${url}`;
-function _sE(payload) {
-const key = _SS;
-const bytes = Array.from(new TextEncoder().encode(JSON.stringify(payload)));
-const enc = bytes.map((b, i)=>b ^ key.charCodeAt(i % key.length));
-return btoa(String.fromCharCode(...enc))
-.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+
+
+/* XOR 암호화 → URL-safe base64 */
+function shareEncrypt(payload) {
+    const key   = SHARE_SECRET;
+    const bytes = Array.from(new TextEncoder().encode(JSON.stringify(payload)));
+    const enc   = bytes.map((b, i) => b ^ key.charCodeAt(i % key.length));
+    return btoa(String.fromCharCode(...enc))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
-function _sD(token) {
-const key = _SS;
-const b64 = token.replace(/-/g, '+').replace(/_/g, '/');
-const bytes = Array.from(atob(b64), c=>c.charCodeAt(0));
-const dec = bytes.map((b, i)=>b ^ key.charCodeAt(i % key.length));
-return JSON.parse(new TextDecoder().decode(new Uint8Array(dec)));
+
+/* URL-safe base64 → XOR 복호화 */
+function shareDecrypt(token) {
+    const key     = SHARE_SECRET;
+    const b64     = token.replace(/-/g, '+').replace(/_/g, '/');
+    const bytes   = Array.from(atob(b64), c => c.charCodeAt(0));
+    const dec     = bytes.map((b, i) => b ^ key.charCodeAt(i % key.length));
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(dec)));
 }
-function _cSL() {
-const SS_TOKEN = '_shr_t';
-const SS_URL = '_shr_u';
-const SS_BLOCKED = '_shr_blocked';
-const LS_BACKUP = '_shr_ls'; // localStorage 이중 백업 키
-const LS_EXP_FLAG = '_shr_exp'; // 만료 확정 플래그 (localStorage)
-try {
-if (localStorage.getItem(LS_EXP_FLAG)) {
-const freshToken = new URLSearchParams(location.search).get(_SP);
-const isSharSess = !!sessionStorage.getItem('_shr_sess_alive')
-|| !!sessionStorage.getItem(SS_BLOCKED)
-|| !!sessionStorage.getItem(SS_TOKEN);
-if (!freshToken&&isSharSess) {
-_sEAB();
-return false;
+
+/* ════════════════════════════════════════════
+   임시 공유 링크 검증 (DOMContentLoaded 이전 실행)
+   ────────────────────────────────────────────
+   URL ?share=TOKEN 파라미터를 확인하고
+   만료된 경우 만료 페이지를 즉시 표시합니다.
+   유효한 경우 앱을 정상 실행합니다.
+   TOKEN = btoa(JSON.stringify({ exp: 만료_ms }))
+════════════════════════════════════════════ */
+/* ════════════════════════════════════════════
+   임시 공유 링크 검증 (DOMContentLoaded 이전 실행)
+   ────────────────────────────────────────────
+   sessionStorage 키
+     _shr_t       : 암호화 토큰
+     _shr_u       : 원본 URL (공유 버튼 패스스루용)
+     _shr_blocked : 만료 차단 플래그
+                    (탭이 열려있는 동안 새로고침해도 만료 페이지 유지)
+
+   ① 차단 플래그 있음   → 즉시 만료 페이지
+   ② URL에 유효 토큰   → URL 정리 + sessionStorage 저장 → 앱 실행
+   ③ URL에 만료 토큰   → URL 정리 하지 않음 (새로고침해도 동일 URL)
+                          + 차단 플래그 설정 → 만료 페이지
+   ④ sessionStorage 토큰 만료 → 차단 플래그 설정 → 만료 페이지
+   ⑤ 토큰 없음         → 정상 앱 실행
+════════════════════════════════════════════ */
+function checkShareLink() {
+    const SS_TOKEN   = '_shr_t';
+    const SS_URL     = '_shr_u';
+    const SS_BLOCKED = '_shr_blocked';
+    const LS_BACKUP  = '_shr_ls';      // localStorage 이중 백업 키
+    const LS_EXP_FLAG = '_shr_exp';    // 만료 확정 플래그 (localStorage)
+
+    /* ── ① 만료 확정 플래그 확인 (localStorage 기반) ──
+       단, 현재 탭이 공유 세션(_shr_sess_alive)일 때만 적용.
+       오너가 같은 브라우저에서 일반 접속 시 영향받지 않음 */
+    try {
+        if (localStorage.getItem(LS_EXP_FLAG)) {
+            const freshToken  = new URLSearchParams(location.search).get(SHARE_PARAM);
+            const isSharSess  = !!sessionStorage.getItem('_shr_sess_alive')
+                             || !!sessionStorage.getItem(SS_BLOCKED)
+                             || !!sessionStorage.getItem(SS_TOKEN);
+            if (!freshToken && isSharSess) {
+                showExpiredAndBlock();
+                return false;
+            }
+            /* 공유 세션 아니면 만료 플래그 무시 (오너 일반 접속) */
+        }
+    } catch (_) {}
+
+    /* ── ② sessionStorage 차단 플래그 ── */
+    try {
+        if (sessionStorage.getItem(SS_BLOCKED)) {
+            showExpiredAndBlock();
+            return false;
+        }
+    } catch (_) {}
+
+    let token   = null;
+    let origUrl = null;
+    let fromUrl = false;
+
+    /* ── ③ URL 파라미터 확인 ── */
+    const urlToken = new URLSearchParams(location.search).get(SHARE_PARAM);
+    if (urlToken) {
+        token   = urlToken;
+        origUrl = location.href;
+        fromUrl = true;
+    } else {
+        /* ── ④ sessionStorage 복원 → 없으면 localStorage 백업 ── */
+        try {
+            token   = sessionStorage.getItem(SS_TOKEN);
+            origUrl = sessionStorage.getItem(SS_URL);
+        } catch (_) {}
+
+        /* sessionStorage 소실 시에만 localStorage 백업 복원
+           (단, 같은 탭의 hard-refresh인 경우만 신뢰
+            탭 닫고 재접속 시 sessionStorage 없음 → LS 백업도 무시 → 오너 모드) */
+        if (!token) {
+            try {
+                /* 탭이 새로 열린 경우인지 판단: sessionStorage에 플래그 없으면 새 세션 */
+                const isSameSess = !!sessionStorage.getItem('_shr_sess_alive');
+                if (isSameSess) {
+                    const ls = JSON.parse(localStorage.getItem(LS_BACKUP) || 'null');
+                    if (ls && ls.t) { token = ls.t; origUrl = ls.u; }
+                }
+            } catch (_) {}
+        }
+    }
+
+    if (!token) return true; // 공유 링크 아님 → 정상 실행
+
+    /* ── ⑤ XOR 복호화 + 만료 검증 ── */
+    let isValid = false;
+    let decoded = null;
+    try {
+        decoded = shareDecrypt(token);
+        isValid = Date.now() < decoded.exp;
+    } catch (_) {}
+
+    if (isValid) {
+        /* URL 정리 (최초 접속 시) */
+        if (fromUrl) {
+            try { history.replaceState(null, '', location.pathname); } catch (_) {}
+        }
+        /* sessionStorage + localStorage 이중 저장 */
+        try {
+            sessionStorage.setItem(SS_TOKEN, token);
+            sessionStorage.setItem(SS_URL,   origUrl);
+            sessionStorage.setItem('_shr_sess_alive', '1'); /* 탭 생존 확인 플래그 */
+        } catch (_) {}
+        try {
+            localStorage.setItem(LS_BACKUP, JSON.stringify({ t: token, u: origUrl }));
+        } catch (_) {}
+
+        /* PWA 설치 권한: 토큰의 allowPwa 플래그 (관리자가 생성 시 결정)
+           true  → 수신자가 홈화면 설치 가능 + 최초 접속 시 안내 카드 표시
+           false → 기존 동작 (manifest/apple 메타 제거 + 설치 프롬프트 차단) */
+        const allowPwa = !!decoded.allowPwa;
+
+        if (!allowPwa) {
+            window.addEventListener('beforeinstallprompt', e => {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }, { capture: true });
+            window._blockPWA = true; /* DOMContentLoaded에서 manifest 제거 */
+        } else {
+            /* PWA 허용: 설치 프롬프트 캡처 → 우리 안내 카드와 연동 */
+            window.addEventListener('beforeinstallprompt', e => {
+                e.preventDefault();
+                window._deferredInstallPrompt = e;
+            });
+        }
+
+        window._shareOrigUrl      = origUrl;
+        window._isShareRecipient  = true;
+        window._shareIncludeFavs  = !!decoded.includeFavs;
+        window._shareAllowPwa     = allowPwa;
+        window._shareExp          = decoded.exp;
+        return true;
+    }
+
+    /* ── ⑥ 만료/위조: URL 난독화 + 이중 차단 플래그 + 만료 페이지 ──
+       index.html 숨김 + 난독화 해시 → kdk0781.github.io/test/#3f7a9b2e */
+    try {
+        const _dir  = location.pathname.replace(/\/[^/]*$/, '/'); // /test/index.html → /test/
+        const _rnd  = Math.random().toString(36).slice(2, 10)
+                    + Math.random().toString(36).slice(2, 10);
+        history.replaceState(null, '', _dir + '#' + _rnd);
+    } catch (_) {}
+    try {
+        /* sessionStorage 차단 */
+        sessionStorage.removeItem(SS_TOKEN);
+        sessionStorage.removeItem(SS_URL);
+        sessionStorage.setItem(SS_BLOCKED, '1');
+        /* localStorage 백업 삭제 + 만료 확정 플래그 */
+        localStorage.removeItem(LS_BACKUP);
+        localStorage.setItem(LS_EXP_FLAG, '1');
+    } catch (_) {}
+
+    showExpiredAndBlock();
+    return false;
 }
+
+/* 만료 페이지 표시 (DOM 준비 여부 자동 감지) */
+function showExpiredAndBlock() {
+    const render = () => {
+        const splash = document.getElementById('splashOverlay');
+        if (!splash) return;
+        splash.style.cssText = 'opacity:1;visibility:visible;display:flex;pointer-events:auto';
+        splash.innerHTML = `
+            <div class="share-expired-page">
+                <div class="sep-icon">${SHARE_EXPIRED_MSG.icon}</div>
+                <h2 class="sep-title">${SHARE_EXPIRED_MSG.title}</h2>
+                <p class="sep-desc">${SHARE_EXPIRED_MSG.desc}</p>
+                <p class="sep-sub">${SHARE_EXPIRED_MSG.sub}</p>
+            </div>`;
+    };
+    /* DOM이 이미 로드됐으면 즉시 실행, 아니면 이벤트 대기 */
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', render, { once: true });
+    } else {
+        render();
+    }
 }
-} catch (_) {}
-try {
-if (sessionStorage.getItem(SS_BLOCKED)) {
-_sEAB();
-return false;
-}
-} catch (_) {}
-let token = null;
-let origUrl = null;
-let fromUrl = false;
-const urlToken = new URLSearchParams(location.search).get(_SP);
-if (urlToken) {
-token = urlToken;
-origUrl = location.href;
-fromUrl = true;
-} else {
-try {
-token = sessionStorage.getItem(SS_TOKEN);
-origUrl = sessionStorage.getItem(SS_URL);
-} catch (_) {}
-if (!token) {
-try {
-const isSameSess = !!sessionStorage.getItem('_shr_sess_alive');
-if (isSameSess) {
-const ls = JSON.parse(localStorage.getItem(LS_BACKUP)||'null');
-if (ls&&ls.t) { token = ls.t; origUrl = ls.u; }
-}
-} catch (_) {}
-}
-}
-if (!token) return true; // 공유 링크 아님 → 정상 실행
-let isValid = false;
-let decoded = null;
-try {
-decoded = _sD(token);
-isValid = Date.now() < decoded.exp;
-} catch (_) {}
-if (isValid) {
-if (fromUrl) {
-try { history.replaceState(null, '', location.pathname); } catch (_) {}
-}
-try {
-sessionStorage.setItem(SS_TOKEN, token);
-sessionStorage.setItem(SS_URL, origUrl);
-sessionStorage.setItem('_shr_sess_alive', '1');
-} catch (_) {}
-try {
-localStorage.setItem(LS_BACKUP, JSON.stringify({ t: token, u: origUrl }));
-} catch (_) {}
-window.addEventListener('beforeinstallprompt', e=>{
-e.preventDefault();
-e.stopImmediatePropagation();
-}, { capture: true });
-window._blockPWA = true;
-window._shareOrigUrl = origUrl;
-window._isShareRecipient = true;
-window._shareIncludeFavs = !!decoded.includeFavs;
-return true;
-}
-try {
-const _dir = location.pathname.replace(/\/[^/]*$/, '/'); // /test/index.html → /test/
-const _rnd = Math.random().toString(36).slice(2, 10)
-+ Math.random().toString(36).slice(2, 10);
-history.replaceState(null, '', _dir + '#' + _rnd);
-} catch (_) {}
-try {
-sessionStorage.removeItem(SS_TOKEN);
-sessionStorage.removeItem(SS_URL);
-sessionStorage.setItem(SS_BLOCKED, '1');
-localStorage.removeItem(LS_BACKUP);
-localStorage.setItem(LS_EXP_FLAG, '1');
-} catch (_) {}
-_sEAB();
-return false;
-}
-function _sEAB() {
-const render = ()=>{
-const splash = document.getElementById('splashOverlay');
-if (!splash) return;
-splash.style.cssText = 'opacity:1;visibility:visible;display:flex;pointer-events:auto';
-splash.innerHTML = `
-<div class="share-expired-page">
-<div class="sep-icon">${_SEM.icon}</div>
-<h2 class="sep-title">${_SEM.title}</h2>
-<p class="sep-desc">${_SEM.desc}</p>
-<p class="sep-sub">${_SEM.sub}</p>
-</div>`;
+
+// 공유 링크 만료 시 앱 실행 중단
+const _shareValid = checkShareLink();
+
+
+
+/* ── 전역 상태 ── */
+let allGroups      = [];
+let filteredGroups = [];
+let activeRegion   = '전체';
+let activeSort     = 'default';
+let areaUnit       = 'sqm';
+let loadedCount    = 0;
+const LOAD_STEP    = 20;
+let searchDebounceTimer = null;
+let scrollObserver = null;
+
+/* ── 즐겨찾기 상태 ── */
+const FAV_KEY         = 'apt_map_favs';
+let   favSet          = new Set();     // Set<string>  key = 지역|아파트
+let   activeFavOnly   = false;         // 즐겨찾기만 보기 토글
+let   activeFirstHome = false;         // 생애최초 LTV 모드
+
+/* ── 최근 검색어 ── */
+const RECENT_KEY      = 'apt_map_recent';
+const RECENT_MAX      = 5;
+let   recentSearches  = [];            // string[]
+
+
+
+/* ── 면적 타입 suffix 매핑 ── */
+const SUFFIX_MAP = {
+    'T':'테라스','P':'펜트','C':'코너',
+    'A':'타입A','B':'타입B','D':'타입D','E':'타입E',
 };
-if (document.readyState==='loading') {
-document.addEventListener('DOMContentLoaded', render, { once: true });
-} else {
-render();
-}
-}
-const _sV = _cSL();
-let _aG = [];
-let _fG = [];
-let _aR = '전체';
-let _aS = 'default';
-let _aU = 'sqm';
-let _lC = 0;
-const _lS = 20;
-let _sDT = null;
-let _sO = null;
-const _FK = 'apt_map_favs';
-let _fS = new Set(); // Set<string> key = 지역|아파트
-let _aFO = false; // 즐겨찾기만 보기 토글
-let _aFH = false; // 생애최초 LTV 모드
-const _RK = 'apt_map_recent';
-const _RM = 5;
-let _rS = []; // string[]
-const _sM = {
-'T':'테라스','P':'펜트','C':'코너',
-'A':'타입A','B':'타입B','D':'타입D','E':'타입E',
+
+/* ── 규제지역 (2025.10.16 기준) ── */
+const ZONE_DATA = {
+    투기지역: {
+        '서울특별시': ['강남구','서초구','송파구','용산구'],
+    },
+    투기과열지구: {
+        '서울특별시': [
+            '강동구','강북구','강서구','관악구','광진구',
+            '구로구','금천구','노원구','도봉구','동대문구',
+            '동작구','마포구','서대문구','성동구','성북구',
+            '양천구','영등포구','은평구','종로구','중구','중랑구',
+        ],
+        '경기도': [
+            '과천시','광명시','의왕시','하남시',
+            '분당구','수정구','중원구',
+            '영통구','장안구','팔달구',
+            '동안구','수지구',
+        ],
+    },
 };
-const _zD = {
-투기지역: {
-'서울특별시': ['강남구','서초구','송파구','용산구'],
-},
-투기과열지구: {
-'서울특별시': [
-'강동구','강북구','강서구','관악구','광진구',
-'구로구','금천구','노원구','도봉구','동대문구',
-'동작구','마포구','서대문구','성동구','성북구',
-'양천구','영등포구','은평구','종로구','중구','중랑구',
-],
-'경기도': [
-'과천시','광명시','의왕시','하남시',
-'분당구','수정구','중원구',
-'영통구','장안구','팔달구',
-'동안구','수지구',
-],
-},
-};
-function _gRZ(sido, sgg) {
-sido = sido.trim(); sgg = sgg.trim();
-const a = _zD.투기지역[sido]||[];
-if (a.some(g=>sgg.includes(g))) return { zone:'A', label:'투기지역' };
-const b = _zD.투기과열지구[sido]||[];
-if (b.some(g=>sgg.includes(g))) return { zone:'B', label:'투기과열지구' };
-return { zone: null, label: '' };
+
+function getRegulationZone(sido, sgg) {
+    sido = sido.trim(); sgg = sgg.trim();
+    const a = ZONE_DATA.투기지역[sido] || [];
+    if (a.some(g => sgg.includes(g))) return { zone:'A', label:'투기지역' };
+    const b = ZONE_DATA.투기과열지구[sido] || [];
+    if (b.some(g => sgg.includes(g))) return { zone:'B', label:'투기과열지구' };
+    return { zone: null, label: '' };
 }
-function _gLL(priceRaw, regZone, midRaw) {
-if (!priceRaw||priceRaw<=0) return null;
-const isReg = regZone==='A'||regZone==='B';
-let ltvRate, ltvPct;
-if (_aFH&&isReg) {
-ltvRate = 0.70;
-ltvPct = 70;
-} else {
-ltvRate = isReg ? 0.40 : 0.70;
-ltvPct = isReg ? 40 : 70;
+
+/* ════════════════════════════════════════════
+   대출 가능 한도 계산
+   ────────────────────────────────────────────
+   LTV 비율 (지역 규제 기준)
+     투기지역 / 투기과열지구 (zone A·B) → 40%
+     기타 지역                           → 70%
+
+   정부 정책 한도 (일반가 기준)
+     ≤ 15억                → 최대 6억
+     15억 초과 ~ 25억 이하 → 최대 4억
+     25억 초과             → 최대 2억
+
+   최종 = min(LTV 계산액, 정책 한도)
+
+   @param priceRaw  기준 가격 (만원)
+   @param regZone   'A' | 'B' | null
+   @param midRaw    정책 한도 판정용 일반가 (만원)
+════════════════════════════════════════════ */
+function getLoanLimit(priceRaw, regZone, midRaw) {
+    if (!priceRaw || priceRaw <= 0) return null;
+
+    const isReg = regZone === 'A' || regZone === 'B';
+
+    /* ── LTV 비율 결정 ──
+       생애최초 모드 ON + 규제지역 → LTV 70% (일반은 40%)
+       정책 한도(6억/4억/2억)는 생애최초도 동일하게 적용 */
+    let ltvRate, ltvPct;
+    if (activeFirstHome && isReg) {
+        ltvRate = 0.70;
+        ltvPct  = 70;
+    } else {
+        ltvRate = isReg ? 0.40 : 0.70;
+        ltvPct  = isReg ? 40   : 70;
+    }
+
+    /* LTV 계산 — 100만원 단위 절사 */
+    const ltvAmt = Math.floor(priceRaw * ltvRate / 100) * 100;
+
+    /* 정책 한도: 일반가(midRaw) 기준 — 생애최초도 동일 */
+    const ref = midRaw || priceRaw;
+    let policyLimit;
+    if (ref <= 150000)      policyLimit = 60000;
+    else if (ref <= 250000) policyLimit = 40000;
+    else                    policyLimit = 20000;
+
+    /* 두 기준 중 낮은 값 */
+    const finalAmt   = Math.min(ltvAmt, policyLimit);
+    const isLtvLimit = finalAmt === ltvAmt && ltvAmt < policyLimit;
+
+    function fmtAmt(man) {
+        const eok  = Math.floor(man / 10000);
+        const rest = man % 10000;
+        if (eok > 0 && rest > 0)
+            return `${eok}억 ${rest.toLocaleString('ko-KR')}만`;
+        if (eok > 0)
+            return `${eok}억`;
+        return `${rest.toLocaleString('ko-KR')}만`;
+    }
+
+    const amtStr = fmtAmt(finalAmt);
+
+    /* CSS 클래스 */
+    let cls;
+    if (activeFirstHome && isReg) {
+        cls = 'loan-first-home'; // 생애최초 규제지역 전용 색상
+    } else if (isLtvLimit) {
+        cls = isReg ? 'loan-ltv-reg' : 'loan-ltv-gen';
+    } else {
+        if (policyLimit === 60000)      cls = 'loan-pol-a';
+        else if (policyLimit === 40000) cls = 'loan-pol-b';
+        else                            cls = 'loan-pol-c';
+    }
+
+    return { amtStr, ltvPct, isLtvLimit, cls };
 }
-const ltvAmt = Math.floor(priceRaw * ltvRate / 100) * 100;
-const ref = midRaw||priceRaw;
-let policyLimit;
-if (ref<=150000) policyLimit = 60000;
-else if (ref<=250000) policyLimit = 40000;
-else policyLimit = 20000;
-const finalAmt = Math.min(ltvAmt, policyLimit);
-const isLtvLimit = finalAmt===ltvAmt&&ltvAmt < policyLimit;
-function fmtAmt(man) {
-const eok = Math.floor(man / 10000);
-const rest = man % 10000;
-if (eok > 0&&rest > 0)
-return `${eok}억 ${rest.toLocaleString('ko-KR')}만`;
-if (eok > 0)
-return `${eok}억`;
-return `${rest.toLocaleString('ko-KR')}만`;
-}
-const amtStr = fmtAmt(finalAmt);
-let cls;
-if (_aFH&&isReg) {
-cls = 'loan-first-home'; // 생애최초 규제지역 전용 색상
-} else if (isLtvLimit) {
-cls = isReg ? 'loan-ltv-reg' : 'loan-ltv-gen';
-} else {
-if (policyLimit===60000) cls = 'loan-pol-a';
-else if (policyLimit===40000) cls = 'loan-pol-b';
-else cls = 'loan-pol-c';
-}
-return { amtStr, ltvPct, isLtvLimit, cls };
-}
-document.addEventListener('DOMContentLoaded', ()=>{
-if (!_sV) return; // 만료 링크면 앱 초기화 중단
-const vEl = document.getElementById('splashVersion');
-if (vEl) vEl.textContent = _V;
-if (window._blockPWA) {
-document.querySelectorAll(
-'link[rel="manifest"], link[rel="apple-touch-icon"], ' +
-'meta[name="apple-mobile-web-app-capable"], ' +
-'meta[name="mobile-web-app-capable"]'
-).forEach(el=>el.remove());
-if ('serviceWorker' in navigator) {
-navigator.serviceWorker.getRegistrations()
-.then(regs=>regs.forEach(r=>r.unregister()))
-.catch(()=>{});
-}
-}
-const _isShared = !!window._isShareRecipient;
-if ('serviceWorker' in navigator&&!_isShared) {
-navigator.serviceWorker.register('sw.js').then(reg=>{
-setTimeout(()=>_rNP(), 3000);
-navigator.serviceWorker.addEventListener('message', (e)=>{
-if (e.data?.type==='CSV_UPDATED') {
-_sCUB();
-}
+document.addEventListener('DOMContentLoaded', () => {
+    if (!_shareValid) return; // 만료 링크면 앱 초기화 중단
+
+    /* 버전 표시 (배포 확인용) */
+    const vEl = document.getElementById('splashVersion');
+    if (vEl) vEl.textContent = APP_VERSION;
+
+    /* 관리자 모드 배지 — 페이지 진입 시 활성 상태면 즉시 표시 */
+    if (!window._isShareRecipient && isAdmin()) {
+        /* DOM 준비 직후 한 번 표시 */
+        requestAnimationFrame(showAdminBadge);
+    }
+
+    /* ── 공유 수신자: PWA 관련 태그 전부 제거 ──
+       토큰의 allowPwa=false 인 경우에만 적용.
+       allowPwa=true 면 manifest를 그대로 두고 SW도 등록해 설치 가능하게 둠. */
+    if (window._blockPWA) {
+        document.querySelectorAll(
+            'link[rel="manifest"], link[rel="apple-touch-icon"], ' +
+            'meta[name="apple-mobile-web-app-capable"], ' +
+            'meta[name="mobile-web-app-capable"]'
+        ).forEach(el => el.remove());
+        /* 이미 등록된 SW도 해제 */
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.getRegistrations()
+                .then(regs => regs.forEach(r => r.unregister()))
+                .catch(() => {});
+        }
+    }
+
+    /* ── SW 등록 정책 ──
+       오너                     → 등록 (CSV 업데이트 푸시/배너)
+       공유 수신자 + PWA 허용  → 등록 (설치 가능 + CSV 업데이트 배너)
+       공유 수신자 + PWA 차단  → 등록 하지 않음 (위에서 이미 unregister) */
+    const _isShared    = !!window._isShareRecipient;
+    const _allowPwaRcv = !!window._shareAllowPwa;
+    const _shouldRegSW = !_isShared || _allowPwaRcv;
+
+    if ('serviceWorker' in navigator && _shouldRegSW) {
+        navigator.serviceWorker.register('sw.js').then(async (reg) => {
+            /* 알림 권한 요청 — 오너만 (수신자에겐 자동 요청 안 함) */
+            if (!_isShared) {
+                setTimeout(() => requestNotificationPermission(), 3000);
+            }
+
+            /* SW로부터 CSV 업데이트 메시지 수신 (오너 + PWA 허용 수신자 모두) */
+            navigator.serviceWorker.addEventListener('message', (e) => {
+                if (e.data?.type === 'CSV_UPDATED') {
+                    showCsvUpdateBanner();
+                }
+            });
+
+            /* Periodic Background Sync — 지원 브라우저에서 12시간마다 CSV 변경 확인
+               PWA 설치자에게 백그라운드 푸시 효과 제공 */
+            try {
+                if ('periodicSync' in reg) {
+                    const status = await navigator.permissions.query({ name: 'periodic-background-sync' });
+                    if (status.state === 'granted') {
+                        await reg.periodicSync.register('csv-check', {
+                            minInterval: 12 * 60 * 60 * 1000, /* 12시간 */
+                        });
+                        console.log('[PeriodicSync] csv-check 등록');
+                    }
+                }
+            } catch (_) {}
+        }).catch(() => {});
+    }
+
+    /* 공유 수신자(SW 미등록 케이스 포함) — 인-앱 폴링으로 CSV 갱신 감지
+       ① PWA 차단 수신자 : SW 없음 → 폴링 필수
+       ② PWA 허용 수신자 : SW 메시지로도 받지만 폴링은 추가 안전망
+       오너는 SW가 처리하므로 폴링하지 않음 */
+    if (_isShared) {
+        setupCsvPollingForRecipient();
+    }
+
+    /* PWA 허용 받은 공유 수신자 — 최초 1회 설치 안내 카드
+       sessionStorage 키로 ‘이번 탭에서 이미 표시했나’ 체크
+       닫기/설치 모두 동일 세션 내 재노출 안 함 */
+    if (_isShared && _allowPwaRcv) {
+        try {
+            if (!sessionStorage.getItem('_shr_pwa_prompt_shown')) {
+                /* 페이지 컨텐츠 표시 후 자연스러운 타이밍 */
+                setTimeout(showPwaInstallPromptForRecipient, 1500);
+                sessionStorage.setItem('_shr_pwa_prompt_shown', '1');
+            }
+        } catch (_) {}
+    }
+
+    /* 강제 새로고침
+       ─────────────────────────────────────────
+       가격 비교 캐시(apt_map_curr / apt_map_prev)는 지우지 않음.
+       새 CSV가 올라올 때까지 지난주 대비 변동이 계속 표시되어야 하기 때문.
+       서비스워커·브라우저 캐시·그 외 localStorage 항목만 초기화.
+       ───────────────────────────────────────── */
+    document.getElementById('hardRefreshBtn').addEventListener('click', async () => {
+        document.querySelector('#hardRefreshBtn span').textContent = '업데이트 중...';
+        try {
+            /* 서비스워커 해제 */
+            if ('serviceWorker' in navigator) {
+                const regs = await navigator.serviceWorker.getRegistrations();
+                await Promise.all(regs.map(r => r.unregister()));
+            }
+            /* 브라우저 캐시 삭제 */
+            if ('caches' in window) {
+                const names = await caches.keys();
+                await Promise.all(names.map(n => caches.delete(n)));
+            }
+            /* localStorage: 반드시 보존할 키들을 먼저 저장 후 clear */
+            const savedCurr        = localStorage.getItem(CACHE_CURR);
+            const savedPrev        = localStorage.getItem(CACHE_PREV);
+            const savedFavs        = localStorage.getItem(FAV_KEY);
+            const savedRecent      = localStorage.getItem(RECENT_KEY);
+
+            const isShareSess  = !!sessionStorage.getItem('_shr_t');
+            const savedShrLs   = isShareSess ? localStorage.getItem('_shr_ls') : null;
+            const savedShrExp  = localStorage.getItem('_shr_exp');
+            localStorage.clear();
+            if (savedCurr)        localStorage.setItem(CACHE_CURR, savedCurr);
+            if (savedPrev)        localStorage.setItem(CACHE_PREV, savedPrev);
+            if (savedFavs)        localStorage.setItem(FAV_KEY, savedFavs);
+            if (savedRecent)      localStorage.setItem(RECENT_KEY, savedRecent);
+
+            if (savedShrLs)       localStorage.setItem('_shr_ls', savedShrLs);
+            if (savedShrExp)      localStorage.setItem('_shr_exp', savedShrExp);
+
+            /* sessionStorage: 공유 관련 키만 보존, 나머지 삭제 */
+            const ssToken    = sessionStorage.getItem('_shr_t');
+            const ssUrl      = sessionStorage.getItem('_shr_u');
+            const ssBlocked  = sessionStorage.getItem('_shr_blocked');
+            const ssAlive    = sessionStorage.getItem('_shr_sess_alive');
+            const ssRecent   = sessionStorage.getItem('_shr_recent');      // 수신자 최근검색
+            const ssRcClr    = sessionStorage.getItem('_shr_rc_cleared');  // 첫접속 판단 플래그
+            sessionStorage.clear();
+            if (ssToken)  sessionStorage.setItem('_shr_t', ssToken);
+            if (ssUrl)    sessionStorage.setItem('_shr_u', ssUrl);
+            if (ssBlocked)sessionStorage.setItem('_shr_blocked', ssBlocked);
+            if (ssAlive)  sessionStorage.setItem('_shr_sess_alive', ssAlive);
+            if (ssRecent) sessionStorage.setItem('_shr_recent', ssRecent);
+            if (ssRcClr)  sessionStorage.setItem('_shr_rc_cleared', ssRcClr);
+        } finally { window.location.reload(true); }
+    });
+
+    /* ─────────────────────────────────────────
+       listBody 클릭 위임
+       ★ 핵심: fav-star-btn 과 accordion-btn 이
+         group-item-header 안의 형제 요소로 완전 분리.
+         star 클릭 시 accordion-btn 클릭 이벤트 없음.
+         accordion 클릭 시 fav-star-btn 클릭 이벤트 없음.
+       ───────────────────────────────────────── */
+    document.getElementById('listBody').addEventListener('click', (e) => {
+
+        /* ── ① 즐겨찾기 별표 (accordion-btn 밖, 형제 요소) ── */
+        const starBtn = e.target.closest('.fav-star-btn');
+        if (starBtn) {
+            const key = starBtn.getAttribute('data-fav-key'); // dataset 미사용 (난독화 충돌 방지)
+            if (!key) return;
+            const wasFav = favSet.has(key);
+            wasFav ? favSet.delete(key) : favSet.add(key);
+            saveFavorites();
+            const isNowFav = favSet.has(key);
+            starBtn.classList.toggle('active', isNowFav);
+            starBtn.textContent = isNowFav ? '⭐' : '☆';
+            starBtn.title = isNowFav ? '즐겨찾기 해제' : '즐겨찾기 추가';
+            /* 즐겨찾기 뷰에서 해제 시만 재렌더링 */
+            if (activeFavOnly && !isNowFav) applyFilters();
+            return; /* accordion 코드 절대 실행 안됨 */
+        }
+
+        /* ── ② 아코디언 (star와 완전히 분리된 영역) ── */
+        const btn = e.target.closest('.accordion-btn');
+        if (!btn) return;
+        /* accordion-btn > group-item-header > group-item 순으로 올라감 */
+        const item = btn.closest('.group-item');
+        if (!item) return;
+        const wasActive = item.classList.contains('active');
+        document.querySelectorAll('.group-item.active').forEach(el => {
+            if (el !== item) el.classList.remove('active');
+        });
+        item.classList.toggle('active', !wasActive);
+        if (!wasActive) {
+            setTimeout(() => {
+                const hdr = document.querySelector('.sticky-header');
+                const hBottom = hdr ? hdr.getBoundingClientRect().bottom : 120;
+                const rect = item.getBoundingClientRect();
+                if (rect.top < hBottom + 10) {
+                    window.scrollTo({ top: window.scrollY + rect.top - hBottom - 10, behavior: 'smooth' });
+                }
+            }, 320);
+        }
+    });
+
+    /* 검색 */
+    const _si = document.getElementById('searchInput');
+    _si.addEventListener('input', () => {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+            applyFilters();
+            renderRecentSearchUI();
+        }, 250);
+    });
+
+    /* 최근 검색어 저장 시점: Enter 확정 또는 포커스 아웃 */
+    const _saveSearchTerm = () => {
+        const v = _si.value.trim();
+        if (v.length >= 2) saveRecentSearch(v); /* 2글자 이상일 때만 저장 */
+    };
+    _si.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            const v = _si.value.trim();
+
+            /* ── 관리자 모드 활성화 ── */
+            if (v === ADMIN_PASSPHRASE) {
+                e.preventDefault();
+                _si.value = '';
+                _si.blur();
+                renderRecentSearchUI();
+                if (window._isShareRecipient) {
+                    /* 공유 수신자 환경에선 활성화 거부 (다른 기기로 유출 방지) */
+                    showToast('⛔ 공유 링크 환경에서는 활성화할 수 없습니다');
+                    return;
+                }
+                setAdmin(true);
+                showAdminBadge();
+                showToast('👑 관리자 모드 활성화 — 공유 버튼에 옵션이 표시됩니다');
+                return;
+            }
+            /* ── 관리자 모드 해제 ── */
+            if (v === ADMIN_PASSPHRASE_OFF) {
+                e.preventDefault();
+                _si.value = '';
+                _si.blur();
+                renderRecentSearchUI();
+                setAdmin(false);
+                hideAdminBadge();
+                showToast('관리자 모드를 해제했습니다');
+                return;
+            }
+
+            if (v === '투데이') {
+                e.preventDefault();
+                _si.value = '';
+                _si.blur(); // 키보드 닫기
+                renderRecentSearchUI();
+                showTodayVisitorPopup();
+                return;
+            }
+            if (v === '알림전송') {
+                e.preventDefault();
+                _si.value = '';
+                _si.blur();
+                renderRecentSearchUI();
+                showPushAdminPanel();
+                return;
+            }
+            if (v === '알림구독') {
+                e.preventDefault();
+                _si.value = '';
+                _si.blur();
+                renderRecentSearchUI();
+                requestPushPermission();
+                return;
+            }
+            _saveSearchTerm();
+            _si.blur(); /* 모바일 키보드 닫기 → 결과 즉시 확인 가능 */
+            renderRecentSearchUI();
+        }
+    });
+    _si.addEventListener('blur', () => {
+        _saveSearchTerm();
+        /* 포커스 아웃 시 최근검색 힌트 표시 딜레이 (클릭 이벤트와 충돌 방지) */
+        setTimeout(renderRecentSearchUI, 150);
+    });
+
+    /* 정렬 */
+    document.getElementById('sortSelect').addEventListener('change', (e) => {
+        activeSort = e.target.value;
+        applyFilters();
+    });
+
+    /* ㎡ ↔ 평 토글 */
+    document.getElementById('unitToggleBtn').addEventListener('click', () => {
+        areaUnit = areaUnit === 'sqm' ? 'pyeong' : 'sqm';
+        document.body.classList.toggle('pyeong-mode', areaUnit === 'pyeong');
+        const btn = document.getElementById('unitToggleBtn');
+        btn.querySelector('.u-label-sqm').classList.toggle('active', areaUnit === 'sqm');
+        btn.querySelector('.u-label-pyeong').classList.toggle('active', areaUnit === 'pyeong');
+    });
+
+    /* 생애최초 LTV 토글 */
+    document.getElementById('firstHomeBtn')?.addEventListener('click', () => {
+        /* ── 기준점 결정 ──
+           1순위: 열려있는 아코디언 탭 (.group-item.active)
+           2순위: 헤더 아래 첫 번째로 보이는 카드 */
+        const _hdrBottom = (document.querySelector('.sticky-header')?.getBoundingClientRect().bottom ?? 0);
+        const _allItems  = [...document.querySelectorAll('#listBody .group-item')];
+
+        /* 열린 탭 우선 */
+        const _openItem = document.querySelector('#listBody .group-item.active');
+
+        let _anchorIdx = -1;
+        if (_openItem) {
+            _anchorIdx = _allItems.indexOf(_openItem);
+        } else {
+            /* 열린 탭 없으면 헤더 아래 첫 번째 카드 */
+            for (let i = 0; i < _allItems.length; i++) {
+                if (_allItems[i].getBoundingClientRect().bottom > _hdrBottom + 2) {
+                    _anchorIdx = i; break;
+                }
+            }
+        }
+
+        activeFirstHome = !activeFirstHome;
+        const btn = document.getElementById('firstHomeBtn');
+        btn.classList.toggle('active', activeFirstHome);
+        btn.title = activeFirstHome ? '생애최초 LTV 해제' : '생애최초 LTV 적용';
+
+        renderInitial(true);
+
+        /* ── 재렌더 후 기준 카드를 스티키 헤더 바로 아래로 스크롤 ── */
+        if (_anchorIdx >= 0) {
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    const _target = document.querySelectorAll('#listBody .group-item')[_anchorIdx];
+                    if (_target) {
+                        const _hdr    = document.querySelector('.sticky-header');
+                        const _hBottom = _hdr ? _hdr.getBoundingClientRect().bottom : 0;
+                        const _rect   = _target.getBoundingClientRect();
+                        window.scrollTo({
+                            top: window.scrollY + _rect.top - _hBottom - 4,
+                            behavior: 'instant'
+                        });
+                    }
+                });
+            });
+        }
+    });
+
+    setupScrollObserver();
+    setupScrollTopBtn(); /* 맨위로 버튼 초기화 */
+    setupShareBtn();     /* 공유 버튼 초기화 */
+
+    /* ── 즐겨찾기 초기화 ── */
+    loadFavorites();
+
+
+
+    const _isShareRecv = !!window._isShareRecipient;
+
+    if (_isShareRecv) {
+        /* ── 공유 링크 수신자 초기화 ──
+           최근검색: sessionStorage 전용 (탭 격리 → 다른 수신자에게 절대 유출 안 됨)
+           새로고침: sessionStorage 유지 → 검색어 보존
+           탭 닫기: sessionStorage 소멸 → 다음 링크 접속 시 빈 상태 (의도된 동작)
+
+           즐겨찾기: 포함 허용 시 → 수신자 자신의 localStorage[apt_map_favs] 사용
+                    미포함 시   → 빈 Set (UI 숨김) */
+        const _rcCleared = sessionStorage.getItem('_shr_rc_cleared');
+        if (!_rcCleared) {
+            /* 새 탭 첫 접속: 최근검색 빈 배열로 시작 */
+            recentSearches = [];
+            sessionStorage.setItem('_shr_recent', '[]');
+            sessionStorage.setItem('_shr_rc_cleared', '1');
+        } else {
+            /* 새로고침: sessionStorage에서 복원 */
+            try {
+                const raw = sessionStorage.getItem('_shr_recent');
+                recentSearches = raw ? JSON.parse(raw) : [];
+            } catch { recentSearches = []; }
+        }
+
+        /* 즐겨찾기 설정 */
+        if (!window._shareIncludeFavs) {
+            favSet = new Set(); /* 즐겨찾기 미포함: UI 숨김 */
+        }
+        /* includeFavs=true면 loadFavorites()에서 이미 로드된 값 그대로 사용 */
+
+        renderRecentSearchUI();
+    } else {
+        /* 오너: localStorage에서 정상 로드 */
+        loadRecentSearches();
+    }
+
+    /* 공유 링크 → 프리뷰 먼저 표시 */
+    if (window._showSharePreview) {
+        showSharePreview();
+        return; // loadData는 startApp()에서 호출
+    }
+
+    /* 오늘 방문자 카운트: 오너(직접) / 수신자(공유) 분리 집계 */
+    trackTodayVisit(!!window._isShareRecipient);
+
+    loadData();
+
+    /* PWA 설치자 Web Push 구독 초기화 */
+    if (isPWAInstalled()) {
+        setupPushNotification();
+    }
 });
-}).catch(()=>{});
-}
-document.getElementById('hardRefreshBtn').addEventListener('click', async ()=>{
-document.querySelector('#hardRefreshBtn span').textContent = '업데이트 중...';
-try {
-if ('serviceWorker' in navigator) {
-const regs = await navigator.serviceWorker.getRegistrations();
-await Promise.all(regs.map(r=>r.unregister()));
-}
-if ('caches' in window) {
-const names = await caches.keys();
-await Promise.all(names.map(n=>caches.delete(n)));
-}
-const savedCurr = localStorage.getItem(_cC);
-const savedPrev = localStorage.getItem(_cP);
-const savedFavs = localStorage.getItem(_FK);
-const savedRecent = localStorage.getItem(_RK);
-const isShareSess = !!sessionStorage.getItem('_shr_t');
-const savedShrLs = isShareSess ? localStorage.getItem('_shr_ls') : null;
-const savedShrExp = localStorage.getItem('_shr_exp');
-localStorage.clear();
-if (savedCurr) localStorage.setItem(_cC, savedCurr);
-if (savedPrev) localStorage.setItem(_cP, savedPrev);
-if (savedFavs) localStorage.setItem(_FK, savedFavs);
-if (savedRecent) localStorage.setItem(_RK, savedRecent);
-if (savedShrLs) localStorage.setItem('_shr_ls', savedShrLs);
-if (savedShrExp) localStorage.setItem('_shr_exp', savedShrExp);
-const ssToken = sessionStorage.getItem('_shr_t');
-const ssUrl = sessionStorage.getItem('_shr_u');
-const ssBlocked = sessionStorage.getItem('_shr_blocked');
-const ssAlive = sessionStorage.getItem('_shr_sess_alive');
-const ssRecent = sessionStorage.getItem('_shr_recent'); // 수신자 최근검색
-const ssRcClr = sessionStorage.getItem('_shr_rc_cleared'); // 첫접속 판단 플래그
-sessionStorage.clear();
-if (ssToken) sessionStorage.setItem('_shr_t', ssToken);
-if (ssUrl) sessionStorage.setItem('_shr_u', ssUrl);
-if (ssBlocked)sessionStorage.setItem('_shr_blocked', ssBlocked);
-if (ssAlive) sessionStorage.setItem('_shr_sess_alive', ssAlive);
-if (ssRecent) sessionStorage.setItem('_shr_recent', ssRecent);
-if (ssRcClr) sessionStorage.setItem('_shr_rc_cleared', ssRcClr);
-} finally { window.location.reload(true); }
-});
-document.getElementById('listBody').addEventListener('click', (e)=>{
-const starBtn = e.target.closest('.fav-star-btn');
-if (starBtn) {
-const key = starBtn.getAttribute('data-fav-key'); // dataset 미사용 (난독화 충돌 방지)
-if (!key) return;
-const wasFav = _fS.has(key);
-wasFav ? _fS.delete(key) : _fS.add(key);
-_sFav();
-const isNowFav = _fS.has(key);
-starBtn.classList.toggle('active', isNowFav);
-starBtn.textContent = isNowFav ? '⭐' : '☆';
-starBtn.title = isNowFav ? '즐겨찾기 해제' : '즐겨찾기 추가';
-if (_aFO&&!isNowFav) _aF();
-return;
-}
-const btn = e.target.closest('.accordion-btn');
-if (!btn) return;
-const item = btn.closest('.group-item');
-if (!item) return;
-const wasActive = item.classList.contains('active');
-document.querySelectorAll('.group-item.active').forEach(el=>{
-if (el!==item) el.classList.remove('active');
-});
-item.classList.toggle('active', !wasActive);
-if (!wasActive) {
-setTimeout(()=>{
-const hdr = document.querySelector('.sticky-header');
-const hBottom = hdr ? hdr.getBoundingClientRect().bottom : 120;
-const rect = item.getBoundingClientRect();
-if (rect.top < hBottom + 10) {
-window.scrollTo({ top: window.scrollY + rect.top - hBottom - 10, behavior: 'smooth' });
-}
-}, 320);
-}
-});
-const _si = document.getElementById('searchInput');
-_si.addEventListener('input', ()=>{
-clearTimeout(_sDT);
-_sDT = setTimeout(()=>{
-_aF();
-_rRSU();
-}, 250);
-});
-const _saveSearchTerm = ()=>{
-const v = _si.value.trim();
-if (v.length>=2) _sRS(v);
-};
-_si.addEventListener('keydown', (e)=>{
-if (e.key==='Enter') {
-const v = _si.value.trim();
-if (v==='투데이') {
-e.preventDefault();
-_si.value = '';
-_si.blur(); // 키보드 닫기
-_rRSU();
-_sTVP();
-return;
-}
-if (v==='알림전송') {
-e.preventDefault();
-_si.value = '';
-_si.blur();
-_rRSU();
-showPushAdminPanel();
-return;
-}
-if (v==='알림구독') {
-e.preventDefault();
-_si.value = '';
-_si.blur();
-_rRSU();
-requestPushPermission();
-return;
-}
-_saveSearchTerm();
-_si.blur();
-_rRSU();
-}
-});
-_si.addEventListener('blur', ()=>{
-_saveSearchTerm();
-setTimeout(_rRSU, 150);
-});
-document.getElementById('sortSelect').addEventListener('change', (e)=>{
-_aS = e.target.value;
-_aF();
-});
-document.getElementById('unitToggleBtn').addEventListener('click', ()=>{
-_aU = _aU==='sqm' ? 'pyeong' : 'sqm';
-document.body.classList.toggle('pyeong-mode', _aU==='pyeong');
-const btn = document.getElementById('unitToggleBtn');
-btn.querySelector('.u-label-sqm').classList.toggle('active', _aU==='sqm');
-btn.querySelector('.u-label-pyeong').classList.toggle('active', _aU==='pyeong');
-});
-document.getElementById('firstHomeBtn')?.addEventListener('click', ()=>{
-const _hdrBottom = (document.querySelector('.sticky-header')?.getBoundingClientRect().bottom ?? 0);
-const _allItems = [...document.querySelectorAll('#listBody .group-item')];
-const _openItem = document.querySelector('#listBody .group-item.active');
-let _anchorIdx = -1;
-if (_openItem) {
-_anchorIdx = _allItems.indexOf(_openItem);
-} else {
-for (let i = 0; i < _allItems.length; i++) {
-if (_allItems[i].getBoundingClientRect().bottom > _hdrBottom + 2) {
-_anchorIdx = i; break;
-}
-}
-}
-_aFH = !_aFH;
-const btn = document.getElementById('firstHomeBtn');
-btn.classList.toggle('active', _aFH);
-btn.title = _aFH ? '생애최초 LTV 해제' : '생애최초 LTV 적용';
-_rI(true);
-if (_anchorIdx>=0) {
-requestAnimationFrame(()=>{
-requestAnimationFrame(()=>{
-const _target = document.querySelectorAll('#listBody .group-item')[_anchorIdx];
-if (_target) {
-const _hdr = document.querySelector('.sticky-header');
-const _hBottom = _hdr ? _hdr.getBoundingClientRect().bottom : 0;
-const _rect = _target.getBoundingClientRect();
-window.scrollTo({
-top: window.scrollY + _rect.top - _hBottom - 4,
-behavior: 'instant'
-});
-}
-});
-});
-}
-});
-_sSO();
-_sSTB();
-_sSB();
-_lFav();
-const _isShareRecv = !!window._isShareRecipient;
-if (_isShareRecv) {
-const _rcCleared = sessionStorage.getItem('_shr_rc_cleared');
-if (!_rcCleared) {
-_rS = [];
-sessionStorage.setItem('_shr_recent', '[]');
-sessionStorage.setItem('_shr_rc_cleared', '1');
-} else {
-try {
-const raw = sessionStorage.getItem('_shr_recent');
-_rS = raw ? JSON.parse(raw) : [];
-} catch { _rS = []; }
-}
-if (!window._shareIncludeFavs) {
-_fS = new Set();
-}
-_rRSU();
-} else {
-_lRS();
-}
-if (window._showSharePreview) {
-showSharePreview();
-return; // _lD는 startApp()에서 호출
-}
-_tTV(!!window._isShareRecipient);
-_lD();
-if (isPWAInstalled()) {
-setupPushNotification();
-}
-});
-function _sSP() {
-const el = document.querySelector('.sticky-header');
-if (!el) return;
-document.documentElement.style.setProperty('scroll-padding-top', (el.offsetHeight + 10) + 'px');
-}
-window.addEventListener('resize', _sSP, { passive: true });
-function _hS() {
-const el = document.getElementById('splashOverlay');
-if (el) el.classList.add('hide');
-}
-function _sSE(msg) {
-const el = document.getElementById('splashOverlay');
-if (!el) return;
-el.innerHTML = `
-<div class="splash-error">
-<span style="font-size:2rem">⚠️</span>
-<p>${msg||'데이터를 불러올 수 없습니다.'}</p>
-<small>새로고침 버튼을 눌러 다시 시도하세요.</small>
-<button onclick="window.location.reload(true)" class="refresh-btn" style="margin-top:16px">
-<span>다시 시도</span>
-</button>
-<small style="margin-top:8px;opacity:0.5">${_V}</small>
-</div>`;
-}
-function _lD() {
-console.log('[_lD] 시작', _V);
-const safetyTimer = setTimeout(()=>{
-console.warn('[_lD] 5초 안전망 발동');
-_hS();
-}, 5000);
-const done = (ok)=>{
-clearTimeout(safetyTimer);
-if (ok) _hS();
-};
-fetch('excel/map.csv', {
-cache: 'no-store',
-headers: { 'Pragma': 'no-cache', 'Cache-Control': 'no-cache, no-store' }
-})
-.then(res=>{
-if (!res.ok) throw new Error('HTTP ' + res.status);
-return res.arrayBuffer();
-})
-.then(buf=>{
-console.log('[_lD] CSV 수신 완료', buf.byteLength, 'bytes');
-let csv;
-try {
-csv = new TextDecoder('euc-kr').decode(buf);
-} catch (e) {
-console.warn('[_lD] euc-kr 디코딩 실패, utf-8 재시도');
-csv = new TextDecoder('utf-8').decode(buf);
-}
-_pAR(csv);
-done(true);
-})
-.catch(err=>{
-console.error('[_lD] 오류:', err);
-done(false);
-_sSE('CSV 파일을 불러올 수 없습니다. (' + err.message + ')');
-});
-}
-function _pCL(line) {
-const fields = [];
-let field = '';
-let inQ = false;
-for (let i = 0; i < line.length; i++) {
-const ch = line[i];
-if (ch==='"') {
-if (inQ&&line[i + 1]==='"') { field += '"'; i++; }
-else inQ = !inQ;
-} else if (ch===','&&!inQ) {
-fields.push(field.trim()); field = '';
-} else {
-field += ch;
-}
-}
-fields.push(field.trim());
-return fields;
-}
-const _cC = 'apt_map_curr';
-const _cP = 'apt_map_prev';
-function _bPK(row) {
-return `${row.시도}|${row.시군구}|${row.동}|${row.아파트}|${row.공급면적}|${row.전용면적}|${row.suffix}`;
-}
-function _rC(key) {
-try {
-const raw = localStorage.getItem(key);
-return raw ? JSON.parse(raw) : null;
-} catch { return null; }
-}
-function _wC(key, data) {
-try {
-localStorage.setItem(key, JSON.stringify(data));
-} catch (e) {
-console.warn('[priceCache] 저장 실패:', e.message);
-}
-}
-function _bCP(dateText, _fD) {
-const p = {};
-for (const row of _fD) {
-p[_bPK(row)] = [row.하한가Raw, row.일반가Raw, row.상한가Raw];
-}
-return { dateText, p };
-}
-function _sPC(_bDT, _fD) {
-const curr = _rC(_cC);
-if (curr&&curr.dateText===_bDT) {
-const prev = _rC(_cP);
-console.log('[priceCache] 같은 주 재로드 → diff 유지', prev ? prev.dateText : '(없음)');
-return prev; // prev가 비교 기준
-}
-if (curr) {
-_wC(_cP, curr);
-console.log('[priceCache] curr→prev 승격:', curr.dateText);
-}
-_wC(_cC, _bCP(_bDT, _fD));
-console.log('[priceCache] 새 curr 저장:', _bDT);
-return curr; // 비교 기준 = 방금 승격된 구 curr (없으면 null)
-}
-function _pAR(csv) {
-console.log('[_pAR] 시작');
-const t0 = Date.now();
-const lines = csv.split(/\r\n|\n/);
-let _bDT = '';
-for (let i = 0; i < Math.min(15, lines.length); i++) {
-const regex = /(20\d{2})[-.년\s]+([0-1]?\d)[-.월\s]+([0-3]?\d)일?/g;
-const dates = [];
-let m;
-while ((m = regex.exec(lines[i]))!==null) {
-dates.push(`${m[1]}.${m[2].padStart(2,'0')}.${m[3].padStart(2,'0')}`);
-}
-if (dates.length>=2) { _bDT = `${dates[0]} ~ ${dates[1]}`; break; }
-if (dates.length===1) { _bDT = dates[0]; break; }
-}
-const dateLabel = document.getElementById('baseDateLabel');
-if (dateLabel) {
-if (_bDT) dateLabel.textContent = '기준일 ' + _bDT;
-else dateLabel.style.display = 'none';
-}
-const SKIP = [
-'전국은행연합회','조견표','절대 수정 금지','대출상담사',
-'시도,시군구','시/도','공급면적','하한가',
-];
-const toNum = v=>parseFloat(String(v).replace(/,/g, ''));
-const toPrice = v=>{ const n = toNum(v); return (isNaN(n)||n===0) ? '-' : n.toLocaleString('ko-KR'); };
-const toRaw = v=>{ const n = toNum(v); return isNaN(n) ? 0 : n; };
-const toArea = v=>{ const n = toNum(v); if(isNaN(n)) return String(v); return n%1===0 ? String(n) : n.toFixed(2).replace(/\.?0+$/,''); };
-const toPyeong = (sqm, p)=>{
-if (p) { const n=toNum(p); if(!isNaN(n)&&n>0) return n+'평'; }
-const n = toNum(sqm);
-return isNaN(n) ? '-' : (n/3.3058).toFixed(1)+'평';
-};
-const getSuffix = v=>{
-const raw = String(v).trim().replace(/^[\d.,]+/,'');
-if (!raw) return '';
-if (/[가-힣]/.test(raw)) return raw.slice(0,6);
-const u = raw.toUpperCase();
-return _sM[u]||raw.slice(0,6);
-};
-const _fD = [];
-for (let i = 0; i < lines.length; i++) {
-const line = lines[i].trim();
-if (!line) continue;
-if (SKIP.some(k=>line.includes(k))) continue;
-const col = _pCL(line);
-if (col.length < 11||!col[0]) continue;
-if (col[3]==='아파트'||col[3]==='단지명') continue;
-const sido = col[0].trim(), sgg = col[1].trim(), dong = col[2].trim(), apt = col[3].trim();
-if (!apt||!sido) continue;
-_fD.push({
-시도: sido, 시군구: sgg, 동: dong,
-지역: `${sido} ${sgg} ${dong}`.replace(/\s+/g,' '),
-아파트: apt,
-공급면적: toArea(col[6]||col[4]), 전용면적: toArea(col[5]),
-공급평형: toPyeong(col[6]||col[4], col[7]), 전용평형: toPyeong(col[5],''),
-suffix: getSuffix(col[4]),
-하한가: toPrice(col[8]||''), 일반가: toPrice(col[9]||''), 상한가: toPrice(col[10]||''),
-하한가Raw: toRaw(col[8]||''),
-일반가Raw: toRaw(col[9]||''),
-상한가Raw: toRaw(col[10]||''),
-diffLow: null, diffMid: null, diffHigh: null,
-});
-}
-const compCache = _sPC(_bDT, _fD);
-if (compCache) {
-const pm = compCache.p;
-for (const row of _fD) {
-const prev = pm[_bPK(row)];
-if (prev) {
-row.diffLow = row.하한가Raw - prev[0];
-row.diffMid = row.일반가Raw - prev[1];
-row.diffHigh = row.상한가Raw - prev[2];
-}
-}
-}
-const map = new Map();
-for (const row of _fD) {
-const key = `${row.시도}|${row.시군구}|${row.동}|${row.아파트}`;
-if (!map.has(key)) {
-const reg = _gRZ(row.시도, row.시군구);
-map.set(key, {
-시도: row.시도, 시군구: row.시군구, 동: row.동,
-지역: row.지역, 아파트: row.아파트,
-rows: [], minPrice: Infinity, maxPrice: 0,
-regZone: reg.zone, regLabel: reg.label,
-});
-}
-const g = map.get(key);
-g.rows.push(row);
-if (row.일반가Raw > 0) {
-g.minPrice = Math.min(g.minPrice, row.일반가Raw);
-g.maxPrice = Math.max(g.maxPrice, row.일반가Raw);
-}
-}
-_aG = Array.from(map.values()).map(g=>{
-if (g.minPrice===Infinity) g.minPrice = 0;
-g.searchKey = `${g.지역} ${g.아파트}`.toLowerCase();
-return g;
-});
-const regions = ['전체', ...new Set(_aG.map(g=>g.시도).sort())];
-_bRC(regions);
-requestAnimationFrame(_sSP);
-_fG = _aG;
-const t1 = Date.now();
-console.log(`[_pAR] 완료: ${_aG.length}단지, ${t1-t0}ms`);
-_rI();
-}
-function _bRC(regions) {
-const wrap = document.getElementById('regionFilter');
-if (!wrap) return;
-const MOBILE_MAIN = new Set(['전체','서울특별시','경기도','인천광역시']);
-const _showFavChip = !window._isShareRecipient||window._shareIncludeFavs;
-wrap.innerHTML = [
-_showFavChip ? `<button class="region-chip fav-chip${_aFO?' active':''}" data-fav="1" title="즐겨찾기한 단지만 보기">
-<span class="fav-chip-star">⭐</span><span class="fav-chip-text"> 즐겨찾기</span>
-</button>` : '',
-...regions.map(r=>{
-const hideCls = MOBILE_MAIN.has(r) ? '' : ' mobile-hidden';
-return `<button class="region-chip${r==='전체'&&!_aFO?' active':''}${hideCls}" data-region="${r}">${r}</button>`;
-})
-].join('');
-wrap.addEventListener('click', (e)=>{
-const chip = e.target.closest('.region-chip');
-if (!chip) return;
-if (chip.dataset.fav) {
-_aFO = !_aFO;
-chip.classList.toggle('active', _aFO);
-wrap.querySelectorAll('.region-chip:not([data-fav])').forEach(c =>
-c.classList.remove('active')
-);
-if (!_aFO) {
-wrap.querySelector('[data-region="전체"]')?.classList.add('active');
-_aR = '전체';
-}
-} else {
-_aFO = false;
-wrap.querySelector('[data-fav]')?.classList.remove('active');
-_aR = chip.dataset.region;
-wrap.querySelectorAll('.region-chip:not([data-fav])').forEach(c =>
-c.classList.toggle('active', c===chip)
-);
-}
-_aF();
-});
-}
-function _aF() {
-const raw = document.getElementById('searchInput').value.trim().toLowerCase();
-const terms = raw ? raw.split(/\s+/) : [];
-let result = _aG;
-if (_aFO) {
-result = result.filter(g=>_fS.has(_fK(g)));
-} else if (_aR!=='전체') {
-result = result.filter(g=>g.시도===_aR);
-}
-if (terms.length > 0) result = result.filter(g=>terms.every(t=>g.searchKey.includes(t)));
-switch (_aS) {
-case 'name': result = [...result].sort((a,b)=>a.아파트.localeCompare(b.아파트,'ko')); break;
-case 'price_asc': result = [...result].sort((a,b)=>(a.minPrice||Infinity)-(b.minPrice||Infinity)); break;
-case 'price_desc':result = [...result].sort((a,b)=>b.maxPrice-a.maxPrice); break;
-case 'diff_up':
-result = result
-.map(g=>{
-const diffs = g.rows.map(r=>r.diffMid).filter(d=>d!==null&&d!==undefined);
-const maxUp = diffs.length ? Math.max(...diffs) : 0;
-return { g, maxUp };
-})
-.filter(({ maxUp })=>maxUp > 0)
-.sort((a, b)=>b.maxUp - a.maxUp)
-.map(({ g })=>g);
-break;
-case 'diff_down':
-result = result
-.map(g=>{
-const diffs = g.rows.map(r=>r.diffMid).filter(d=>d!==null&&d!==undefined);
-const maxDown = diffs.length ? Math.min(...diffs) : 0;
-return { g, maxDown };
-})
-.filter(({ maxDown })=>maxDown < 0)
-.sort((a, b)=>a.maxDown - b.maxDown)
-.map(({ g })=>g);
-break;
-}
-_fG = result;
-_rI();
-}
-function _gPR(g) {
-if (!g.minPrice&&!g.maxPrice) return '';
-if (g.minPrice===g.maxPrice) return g.minPrice.toLocaleString('ko-KR')+'만';
-return `${g.minPrice.toLocaleString('ko-KR')} ~ ${g.maxPrice.toLocaleString('ko-KR')}만`;
-}
-function _dB(diff) {
-if (diff===null||diff===undefined||diff===0)
-return `<span class="price-diff none">-</span>`;
-const abs = Math.abs(diff).toLocaleString('ko-KR');
-return diff > 0
-? `<span class="price-diff up">🔺${abs}</span>`
-: `<span class="price-diff down">🔽${abs}</span>`;
-}
-function _cGH(g) {
-const priceRange = _gPR(g);
-const isRegCard = g.regZone==='A'||g.regZone==='B';
-const ltvPct = (isRegCard&&!_aFH) ? 40 : 70;
-const ltvChipCls = (isRegCard&&_aFH) ? 'ltv-chip ltv-70 ltv-first' : `ltv-chip ltv-${ltvPct}`;
-const ltvChip = `<span class="${ltvChipCls}">LTV ${ltvPct}%${_aFH&&isRegCard ? ' <em class="ltv-fh-mark">생애최초</em>' : ''}</span>`;
-const regBadge = g.regLabel
-? `<div class="reg-badges">
-<span class="reg-badge reg-${g.regZone}">${g.regLabel}</span>
-${ltvChip}
-</div>`
-: `<div class="reg-badges">${ltvChip}</div>`;
-const midDiffs = g.rows.map(r=>r.diffMid).filter(d=>d!==null&&d!==0);
-let groupDiffBadge = '';
-if (midDiffs.length > 0) {
-const maxUp = Math.max(...midDiffs.filter(d=>d > 0), 0);
-const maxDown = Math.min(...midDiffs.filter(d=>d < 0), 0);
-if (maxUp > 0&&maxDown < 0) {
-groupDiffBadge = `<span class="group-diff-badge mixed">🔺🔽 등락</span>`;
-} else if (maxUp > 0) {
-groupDiffBadge = `<span class="group-diff-badge up">🔺${maxUp.toLocaleString('ko-KR')}</span>`;
-} else if (maxDown < 0) {
-groupDiffBadge = `<span class="group-diff-badge down">🔽${Math.abs(maxDown).toLocaleString('ko-KR')}</span>`;
-}
-}
-let rowsHTML = '';
-for (const row of g.rows) {
-const sb = row.suffix ? `<span class="area-suffix">${row.suffix}</span>` : '';
-const loanLow = _gLL(row.하한가Raw, g.regZone, row.일반가Raw);
-const loanLowBadge = loanLow
-? `<span class="loan-badge ${loanLow.cls}">대출 ${loanLow.amtStr}</span>`
-: '';
-const loanMid = _gLL(row.일반가Raw, g.regZone, row.일반가Raw);
-const loanMidBadge = loanMid
-? `<span class="loan-badge ${loanMid.cls}">대출 ${loanMid.amtStr}</span>`
-: '';
-const loanRowHTML = (loanLow||loanMid) ? `
-<div class="loan-info-row">
-<span class="loan-info-label">대출 가능액 :</span>
-<div class="loan-tags">
-${loanLow ? `<span class="loan-tag ${loanLow.cls}"><em class="loan-tag-label">1층</em>${loanLow.amtStr}</span>` : ''}
-${loanMid ? `<span class="loan-tag ${loanMid.cls}"><em class="loan-tag-label">일반</em>${loanMid.amtStr}</span>` : ''}
-</div>
-</div>` : '';
-rowsHTML += `
-<div class="inner-row">
-<div class="inner-main">
-<div class="inner-area">
-<span class="area-val u-sqm">${row.공급면적}㎡</span>
-<span class="area-divider u-sqm">/</span>
-<span class="area-val exclusive u-sqm">${row.전용면적}㎡</span>
-<span class="area-val u-pyeong">${row.공급평형}</span>
-<span class="area-divider u-pyeong">/</span>
-<span class="area-val exclusive u-pyeong">${row.전용평형}</span>
-${sb}
-</div>
-<div class="inner-prices">
-<div class="price-box low">
-<span class="price-label">하한가</span>
-<span class="price-val">${row.하한가}</span>
-${_dB(row.diffLow)}
-</div>
-<div class="price-box mid">
-<span class="price-label">일반가</span>
-<span class="price-val">${row.일반가}</span>
-${_dB(row.diffMid)}
-</div>
-<div class="price-box high">
-<span class="price-label">상한가</span>
-<span class="price-val">${row.상한가}</span>
-${_dB(row.diffHigh)}
-</div>
-</div>
-</div>
-${loanRowHTML}
-</div>`;
-}
-const isFav = _fS.has(_fK(g));
-const fKey = _fK(g);
-const _showStar = !window._isShareRecipient||window._shareIncludeFavs;
-const _starHTML = _showStar
-? `<button class="fav-star-btn${isFav?' active':''}"
-data-fav-key="${fKey}"
-title="${isFav?'즐겨찾기 해제':'즐겨찾기 추가'}"
-type="button">${isFav?'⭐':'☆'}</button>`
-: '';
-return `
-<div class="group-item${g.regZone?' has-reg zone-'+g.regZone:''}">
-<div class="group-item-header">
-${_starHTML}
-<div class="accordion-btn">
-<div class="group-title-wrap">
-<span class="group-apt">${g.아파트}</span>
-<span class="group-region">${g.지역}</span>
-${regBadge}
-</div>
-<div class="accordion-right">
-${groupDiffBadge}
-${priceRange?`<span class="price-range-badge">${priceRange}</span>`:''}
-<span class="row-count-badge">${g.rows.length}개</span>
-<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-</div>
-</div>
-</div>
-<div class="accordion-content">
-<div class="content-header">
-<span class="header-area">면적 (공급 / 전용)
-<span class="header-unit-badge u-sqm">㎡</span>
-<span class="header-unit-badge u-pyeong">평</span>
-</span>
-<span class="header-unit">(단위: 만원)</span>
-</div>
-${rowsHTML}
-</div>
-</div>`;
-}
-function _rI(keepScroll) {
-const listBody = document.getElementById('listBody');
-const sentinel = document.getElementById('scrollSentinel');
-const countEl = document.getElementById('resultCount');
-listBody.innerHTML = '';
-_lC = 0;
-const total = _fG.length;
-const isFiltered = _aR!=='전체'||_aFO||document.getElementById('searchInput').value.trim()!=='';
-if (countEl) {
-countEl.textContent = isFiltered
-? `${total.toLocaleString()}개 단지`
-: `전체 ${_aG.length.toLocaleString()}개 단지`;
-}
-if (total===0) {
-listBody.innerHTML = `<div class="empty-state"><span class="empty-icon">🔍</span><p>조건에 맞는 시세 정보가 없습니다.</p><small>검색어 또는 지역 필터를 변경해보세요.</small></div>`;
-sentinel.style.display = 'none';
-return;
-}
-if (keepScroll) {
-const _estCount = Math.ceil((window.scrollY + window.innerHeight * 2) / 100) + _lS;
-const _need = Math.min(_estCount, _fG.length);
-while (_lC < _need) _lM();
-} else {
-_lM();
-window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-}
-function _lM() {
-const listBody = document.getElementById('listBody');
-const sentinel = document.getElementById('scrollSentinel');
-const next = Math.min(_lC + _lS, _fG.length);
-const slice = _fG.slice(_lC, next);
-if (slice.length > 0) listBody.insertAdjacentHTML('beforeend', slice.map(_cGH).join(''));
-_lC = next;
-sentinel.style.display = _lC>=_fG.length ? 'none' : 'block';
-}
-function _sSO() {
-const sentinel = document.getElementById('scrollSentinel');
-_sO = new IntersectionObserver(
-entries=>{ if (entries[0].isIntersecting) _lM(); },
-{ rootMargin: '300px' }
-);
-if (sentinel) _sO.observe(sentinel);
-}
-const _sTT = 300;
-function _sSTB() {
-const btn = document.getElementById('scrollTopBtn');
-if (!btn) return;
-window.addEventListener('scroll', ()=>{
-if (window.scrollY > _sTT) {
-btn.classList.add('visible');
-} else {
-btn.classList.remove('visible');
-}
-}, { passive: true });
-btn.addEventListener('click', ()=>{
-window.scrollTo({ top: 0, behavior: 'smooth' });
-});
-}
-function _sSB() {
-const openBtn = document.getElementById('shareBtnOpen');
-const modal = document.getElementById('shareModal');
-const closeBtn = document.getElementById('shareCloseBtn');
-const genBtn = document.getElementById('shareGenBtn');
-const copyBtn = document.getElementById('shareCopyBtn');
-const linkInput = document.getElementById('shareLinkInput');
-const resultBox = document.getElementById('shareResultBox');
-const copyMsg = document.getElementById('shareCopyMsg');
-if (!openBtn) return;
-const _eT = !!window._isShareRecipient;
-if (_eT) {
-openBtn.addEventListener('click', async ()=>{
-const originalUrl = window._shareOrigUrl||location.href;
-try { await navigator.clipboard.writeText(originalUrl); }
-catch (_) {
-const tmp = document.createElement('textarea');
-tmp.value = originalUrl;
-document.body.appendChild(tmp);
-tmp.select(); document.execCommand('copy');
-document.body.removeChild(tmp);
-}
-const span = openBtn.querySelector('span');
-const orig = span ? span.textContent : '';
-if (span) span.textContent = '복사됨!';
-openBtn.style.background = 'var(--primary-color)';
-openBtn.style.color = '#1a1f24';
-setTimeout(()=>{
-if (span) span.textContent = orig;
-openBtn.style.background = '';
-openBtn.style.color = '';
-}, 2000);
-});
-return;
-}
-openBtn.addEventListener('click', ()=>{
-modal.classList.add('open');
-resultBox.style.display = 'none';
-copyMsg.style.display = 'none';
-});
-closeBtn.addEventListener('click', ()=>modal.classList.remove('open'));
-modal.addEventListener('click', e=>{
-if (e.target===modal) modal.classList.remove('open');
-});
-genBtn.addEventListener('click', async ()=>{
-const dur = Math.max(1, parseInt(document.getElementById('shareDuration').value)||1);
-const unit = parseInt(document.getElementById('shareUnit').value);
-const exp = Date.now() + dur * unit;
-const _inclFav = document.getElementById('shareFavToggle')?.checked||false;
-const token = _sE({ exp, includeFavs: _inclFav });
-const baseUrl = new URL(location.href);
-baseUrl.pathname = baseUrl.pathname.replace(/\/index\.html$/, '/');
-baseUrl.search = '?' + _SP + '=' + token;
-baseUrl.hash = '';
-const longUrl = baseUrl.toString();
-resultBox.style.display = 'flex';
-copyMsg.style.display = 'none';
-linkInput.value = '링크 생성 중...';
-copyBtn.disabled = true;
-const d = new Date(exp);
-document.getElementById('shareExpLabel').textContent =
-'만료: ' + d.toLocaleDateString('ko-KR') + ' ' +
-d.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit' });
-let finalUrl = longUrl;
-try {
-const res = await fetch(
-'https://is.gd/create.php?format=simple&url=' + encodeURIComponent(longUrl)
-);
-const short = (await res.text()).trim();
-if (short.startsWith('http')) finalUrl = short;
-} catch (_) { }
-const msgText = _SCT(finalUrl);
-linkInput.value = msgText; // 메시지 미리보기
-copyBtn.disabled = false;
-const urlOnlyBtn = document.getElementById('shareUrlOnlyBtn');
-if (urlOnlyBtn) urlOnlyBtn.dataset.url = finalUrl;
-window._shareOrigUrl = finalUrl; // 수신자 재공유용
-});
-copyBtn.addEventListener('click', async ()=>{
-const text = linkInput.value;
-try { await navigator.clipboard.writeText(text); }
-catch (_) { linkInput.select(); document.execCommand('copy'); }
-copyMsg.style.display = 'block';
-setTimeout(()=>{ copyMsg.style.display = 'none'; }, 2500);
-});
-document.getElementById('shareUrlOnlyBtn')?.addEventListener('click', async ()=>{
-const urlBtn = document.getElementById('shareUrlOnlyBtn');
-const url = urlBtn?.dataset.url||window._shareOrigUrl||'';
-if (!url) return;
-try { await navigator.clipboard.writeText(url); }
-catch (_) {
-const t = document.createElement('textarea');
-t.value = url; document.body.appendChild(t);
-t.select(); document.execCommand('copy'); t.remove();
-}
-const orig = urlBtn.textContent;
-urlBtn.textContent = '✅ 복사됨!';
-setTimeout(()=>{ urlBtn.textContent = orig; }, 2000);
-});
-}
+
+/* 스티키 헤더 높이 동기화 */
+function syncScrollPadding() {
+    const el = document.querySelector('.sticky-header');
+    if (!el) return;
+    document.documentElement.style.setProperty('scroll-padding-top', (el.offsetHeight + 10) + 'px');
+}
+window.addEventListener('resize', syncScrollPadding, { passive: true });
+
+/* ════════════════════════════════════════════
+   스플래시 제어
+════════════════════════════════════════════ */
+function hideSplash() {
+    const el = document.getElementById('splashOverlay');
+    if (el) el.classList.add('hide');
+}
+
+function showSplashError(msg) {
+    const el = document.getElementById('splashOverlay');
+    if (!el) return;
+    el.innerHTML = `
+        <div class="splash-error">
+            <span style="font-size:2rem">⚠️</span>
+            <p>${msg || '데이터를 불러올 수 없습니다.'}</p>
+            <small>새로고침 버튼을 눌러 다시 시도하세요.</small>
+            <button onclick="window.location.reload(true)" class="refresh-btn" style="margin-top:16px">
+                <span>다시 시도</span>
+            </button>
+            <small style="margin-top:8px;opacity:0.5">${APP_VERSION}</small>
+        </div>`;
+}
+
+/* ════════════════════════════════════════════
+   데이터 로딩
+   - 5초 안전망 타이머 (무한 로딩 절대 방지)
+   - fetch 실패 → showSplashError (영원히 안 닫히는 스플래시 없음)
+   - 파싱 예외 → showSplashError
+   - 정상 완료 → hideSplash
+   세 경우 모두 반드시 스플래시가 처리됨
+════════════════════════════════════════════ */
+function loadData() {
+    console.log('[loadData] 시작', APP_VERSION);
+
+    /* 5초 안전망: 어떤 경우에도 스플래시 닫힘 */
+    const safetyTimer = setTimeout(() => {
+        console.warn('[loadData] 5초 안전망 발동');
+        hideSplash();
+    }, 5000);
+
+    const done = (ok) => {
+        clearTimeout(safetyTimer);
+        if (ok) hideSplash();
+    };
+
+    fetch('excel/map.csv', {
+            cache: 'no-store',
+            headers: { 'Pragma': 'no-cache', 'Cache-Control': 'no-cache, no-store' }
+        })
+        .then(res => {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.arrayBuffer();
+        })
+        .then(buf => {
+            console.log('[loadData] CSV 수신 완료', buf.byteLength, 'bytes');
+            let csv;
+            try {
+                csv = new TextDecoder('euc-kr').decode(buf);
+            } catch (e) {
+                console.warn('[loadData] euc-kr 디코딩 실패, utf-8 재시도');
+                csv = new TextDecoder('utf-8').decode(buf);
+            }
+            parseAndRender(csv);
+            done(true);
+        })
+        .catch(err => {
+            console.error('[loadData] 오류:', err);
+            done(false);
+            showSplashError('CSV 파일을 불러올 수 없습니다. (' + err.message + ')');
+        });
+}
+
+/* ════════════════════════════════════════════
+   안전한 CSV 한 줄 파서 (상태기계, O(n))
+   기존 정규식은 홀수 따옴표에서 무한 루프 발생
+════════════════════════════════════════════ */
+function parseCSVLine(line) {
+    const fields = [];
+    let field = '';
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+            if (inQ && line[i + 1] === '"') { field += '"'; i++; }
+            else inQ = !inQ;
+        } else if (ch === ',' && !inQ) {
+            fields.push(field.trim()); field = '';
+        } else {
+            field += ch;
+        }
+    }
+    fields.push(field.trim());
+    return fields;
+}
+
+/* ════════════════════════════════════════════
+   가격 캐시 (localStorage)  ─ 두 슬롯 구조
+   ┌──────────────────────────────────────┐
+   │ apt_map_curr : 현재 주 데이터        │
+   │ apt_map_prev : 비교 기준(이전 주)    │
+   └──────────────────────────────────────┘
+   동작:
+   ① 새 날짜 CSV 업로드 시
+      기존 curr → prev 승격
+      새 데이터 → curr 저장
+      diff = 새 데이터 vs (승격된) prev
+
+   ② 같은 날짜 재로드 / 새로고침 / 강제 새로고침
+      curr · prev 변동 없음
+      diff = curr vs prev  ← 다음 업로드 전까지 영구 유지
+
+   ※ 강제 새로고침(hardRefreshBtn)은 서비스워커·브라우저캐시만 초기화.
+      가격 캐시 두 슬롯은 건드리지 않으므로 diff가 사라지지 않음.
+════════════════════════════════════════════ */
+const CACHE_CURR = 'apt_map_curr';
+const CACHE_PREV = 'apt_map_prev';
+
+function buildPriceKey(row) {
+    return `${row.시도}|${row.시군구}|${row.동}|${row.아파트}|${row.공급면적}|${row.전용면적}|${row.suffix}`;
+}
+
+function readCache(key) {
+    try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+}
+
+function writeCache(key, data) {
+    try {
+        localStorage.setItem(key, JSON.stringify(data));
+    } catch (e) {
+        console.warn('[priceCache] 저장 실패:', e.message);
+    }
+}
+
+function buildCachePayload(dateText, flatData) {
+    const p = {};
+    for (const row of flatData) {
+        p[buildPriceKey(row)] = [row.하한가Raw, row.일반가Raw, row.상한가Raw];
+    }
+    return { dateText, p };
+}
+
+/**
+ * 캐시 비교 + 갱신
+ * @returns {Object|null}  비교 기준 캐시 (없으면 null → diff 미표시)
+ */
+function syncPriceCache(baseDateText, flatData) {
+    const curr = readCache(CACHE_CURR);
+
+    if (curr && curr.dateText === baseDateText) {
+        // ② 같은 주 재로드 → prev 그대로 유지, diff 계속 표시
+        const prev = readCache(CACHE_PREV);
+        console.log('[priceCache] 같은 주 재로드 → diff 유지', prev ? prev.dateText : '(없음)');
+        return prev;          // prev가 비교 기준
+    }
+
+    // ① 새 날짜 CSV
+    // 기존 curr → prev 승격
+    if (curr) {
+        writeCache(CACHE_PREV, curr);
+        console.log('[priceCache] curr→prev 승격:', curr.dateText);
+    }
+    // 새 데이터 → curr 저장
+    writeCache(CACHE_CURR, buildCachePayload(baseDateText, flatData));
+    console.log('[priceCache] 새 curr 저장:', baseDateText);
+
+    return curr;    // 비교 기준 = 방금 승격된 구 curr (없으면 null)
+}
+
+/* ════════════════════════════════════════════
+   CSV 파싱 + 렌더링 (완전 동기, 38ms)
+════════════════════════════════════════════ */
+function parseAndRender(csv) {
+    console.log('[parseAndRender] 시작');
+    const t0 = Date.now();
+
+    const lines = csv.split(/\r\n|\n/);
+
+    /* 기준일 추출 */
+    let baseDateText = '';
+    for (let i = 0; i < Math.min(15, lines.length); i++) {
+        const regex = /(20\d{2})[-.년\s]+([0-1]?\d)[-.월\s]+([0-3]?\d)일?/g;
+        const dates = [];
+        let m;
+        while ((m = regex.exec(lines[i])) !== null) {
+            dates.push(`${m[1]}.${m[2].padStart(2,'0')}.${m[3].padStart(2,'0')}`);
+        }
+        if (dates.length >= 2) { baseDateText = `${dates[0]} ~ ${dates[1]}`; break; }
+        if (dates.length === 1) { baseDateText = dates[0]; break; }
+    }
+    const dateLabel = document.getElementById('baseDateLabel');
+    if (dateLabel) {
+        if (baseDateText) dateLabel.textContent = '기준일 ' + baseDateText;
+        else dateLabel.style.display = 'none';
+    }
+
+    /* 스킵 키워드 */
+    const SKIP = [
+        '전국은행연합회','조견표','절대 수정 금지','대출상담사',
+        '시도,시군구','시/도','공급면적','하한가',
+    ];
+
+    /* 헬퍼 */
+    const toNum  = v => parseFloat(String(v).replace(/,/g, ''));
+    const toPrice = v => { const n = toNum(v); return (isNaN(n)||n===0) ? '-' : n.toLocaleString('ko-KR'); };
+    const toRaw  = v => { const n = toNum(v); return isNaN(n) ? 0 : n; };
+    const toArea = v => { const n = toNum(v); if(isNaN(n)) return String(v); return n%1===0 ? String(n) : n.toFixed(2).replace(/\.?0+$/,''); };
+    const toPyeong = (sqm, p) => {
+        if (p) { const n=toNum(p); if(!isNaN(n)&&n>0) return n+'평'; }
+        const n = toNum(sqm);
+        return isNaN(n) ? '-' : (n/3.3058).toFixed(1)+'평';
+    };
+    const getSuffix = v => {
+        const raw = String(v).trim().replace(/^[\d.,]+/,'');
+        if (!raw) return '';
+        if (/[가-힣]/.test(raw)) return raw.slice(0,6);
+        const u = raw.toUpperCase();
+        return SUFFIX_MAP[u] || raw.slice(0,6);
+    };
+
+    /* 파싱 */
+    const flatData = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (SKIP.some(k => line.includes(k))) continue;
+
+        const col = parseCSVLine(line);
+        if (col.length < 11 || !col[0]) continue;
+        if (col[3] === '아파트' || col[3] === '단지명') continue;
+
+        const sido = col[0].trim(), sgg = col[1].trim(), dong = col[2].trim(), apt = col[3].trim();
+        if (!apt || !sido) continue;
+
+        flatData.push({
+            시도: sido, 시군구: sgg, 동: dong,
+            지역: `${sido} ${sgg} ${dong}`.replace(/\s+/g,' '),
+            아파트: apt,
+            공급면적: toArea(col[6]||col[4]), 전용면적: toArea(col[5]),
+            공급평형: toPyeong(col[6]||col[4], col[7]), 전용평형: toPyeong(col[5],''),
+            suffix: getSuffix(col[4]),
+            하한가: toPrice(col[8]||''), 일반가: toPrice(col[9]||''), 상한가: toPrice(col[10]||''),
+            하한가Raw: toRaw(col[8]||''),
+            일반가Raw: toRaw(col[9]||''),
+            상한가Raw: toRaw(col[10]||''),
+            // 가격 변동 (loadPriceCache 비교 후 주입)
+            diffLow: null, diffMid: null, diffHigh: null,
+        });
+    }
+
+    /* ── 지난주 가격 비교 ── */
+    const compCache = syncPriceCache(baseDateText, flatData);
+    if (compCache) {
+        const pm = compCache.p;
+        for (const row of flatData) {
+            const prev = pm[buildPriceKey(row)];
+            if (prev) {
+                row.diffLow  = row.하한가Raw - prev[0];
+                row.diffMid  = row.일반가Raw - prev[1];
+                row.diffHigh = row.상한가Raw - prev[2];
+            }
+        }
+    }
+
+    /* 그룹화 */
+    const map = new Map();
+    for (const row of flatData) {
+        const key = `${row.시도}|${row.시군구}|${row.동}|${row.아파트}`;
+        if (!map.has(key)) {
+            const reg = getRegulationZone(row.시도, row.시군구);
+            map.set(key, {
+                시도: row.시도, 시군구: row.시군구, 동: row.동,
+                지역: row.지역, 아파트: row.아파트,
+                rows: [], minPrice: Infinity, maxPrice: 0,
+                regZone: reg.zone, regLabel: reg.label,
+            });
+        }
+        const g = map.get(key);
+        g.rows.push(row);
+        if (row.일반가Raw > 0) {
+            g.minPrice = Math.min(g.minPrice, row.일반가Raw);
+            g.maxPrice = Math.max(g.maxPrice, row.일반가Raw);
+        }
+    }
+
+    allGroups = Array.from(map.values()).map(g => {
+        if (g.minPrice === Infinity) g.minPrice = 0;
+        g.searchKey = `${g.지역} ${g.아파트}`.toLowerCase();
+        return g;
+    });
+
+    /* 지역 칩 */
+    const regions = ['전체', ...new Set(allGroups.map(g => g.시도).sort())];
+    buildRegionChips(regions);
+    requestAnimationFrame(syncScrollPadding);
+
+    filteredGroups = allGroups;
+
+    const t1 = Date.now();
+    console.log(`[parseAndRender] 완료: ${allGroups.length}단지, ${t1-t0}ms`);
+
+    renderInitial();
+}
+
+/* ════════════════════════════════════════════
+   지역 칩 (즐겨찾기 칩 포함)
+════════════════════════════════════════════ */
+function buildRegionChips(regions) {
+    const wrap = document.getElementById('regionFilter');
+    if (!wrap) return;
+
+    /* 모바일 주요 지역 목록 (이 외는 mobile-hidden 클래스로 숨김) */
+    const MOBILE_MAIN = new Set(['전체','서울특별시','경기도','인천광역시']);
+
+    /* 공유 수신자 + 즐겨찾기 미포함이면 칩 숨김 */
+    const _showFavChip = !window._isShareRecipient || window._shareIncludeFavs;
+
+    wrap.innerHTML = [
+        /* 즐겨찾기 칩 (항상 첫 번째) */
+        _showFavChip ? `<button class="region-chip fav-chip${activeFavOnly?' active':''}" data-fav="1" title="즐겨찾기한 단지만 보기">
+            <span class="fav-chip-star">⭐</span><span class="fav-chip-text"> 즐겨찾기</span>
+         </button>` : '',
+        /* 지역 칩 */
+        ...regions.map(r => {
+            const hideCls = MOBILE_MAIN.has(r) ? '' : ' mobile-hidden';
+            return `<button class="region-chip${r==='전체'&&!activeFavOnly?' active':''}${hideCls}" data-region="${r}">${r}</button>`;
+        })
+    ].join('');
+
+    wrap.addEventListener('click', (e) => {
+        const chip = e.target.closest('.region-chip');
+        if (!chip) return;
+
+        if (chip.dataset.fav) {
+            /* 즐겨찾기 토글 */
+            activeFavOnly = !activeFavOnly;
+            chip.classList.toggle('active', activeFavOnly);
+            /* 즐겨찾기 활성 시 지역 칩 비활성화 */
+            wrap.querySelectorAll('.region-chip:not([data-fav])').forEach(c =>
+                c.classList.remove('active')
+            );
+            if (!activeFavOnly) {
+                /* 즐겨찾기 해제 시 전체 칩 다시 활성 */
+                wrap.querySelector('[data-region="전체"]')?.classList.add('active');
+                activeRegion = '전체';
+            }
+        } else {
+            /* 지역 칩 */
+            activeFavOnly = false;
+            wrap.querySelector('[data-fav]')?.classList.remove('active');
+            activeRegion = chip.dataset.region;
+            wrap.querySelectorAll('.region-chip:not([data-fav])').forEach(c =>
+                c.classList.toggle('active', c === chip)
+            );
+        }
+        applyFilters();
+    });
+}
+
+/* ════════════════════════════════════════════
+   필터 + 정렬
+════════════════════════════════════════════ */
+function applyFilters() {
+    const raw   = document.getElementById('searchInput').value.trim().toLowerCase();
+    const terms = raw ? raw.split(/\s+/) : [];
+
+    let result = allGroups;
+
+    /* 즐겨찾기 필터 */
+    if (activeFavOnly) {
+        result = result.filter(g => favSet.has(favKey(g)));
+    } else if (activeRegion !== '전체') {
+        result = result.filter(g => g.시도 === activeRegion);
+    }
+
+    if (terms.length > 0) result = result.filter(g => terms.every(t => g.searchKey.includes(t)));
+
+    switch (activeSort) {
+        case 'name':      result = [...result].sort((a,b) => a.아파트.localeCompare(b.아파트,'ko')); break;
+        case 'price_asc': result = [...result].sort((a,b) => (a.minPrice||Infinity)-(b.minPrice||Infinity)); break;
+        case 'price_desc':result = [...result].sort((a,b) => b.maxPrice-a.maxPrice); break;
+        case 'diff_up':
+            /* 지난주 대비 상승순: 변동없음 제외 + 최대 상승폭 내림차순 */
+            result = result
+                .map(g => {
+                    const diffs = g.rows.map(r => r.diffMid).filter(d => d !== null && d !== undefined);
+                    const maxUp = diffs.length ? Math.max(...diffs) : 0;
+                    return { g, maxUp };
+                })
+                .filter(({ maxUp }) => maxUp > 0)   /* 상승 있는 단지만 */
+                .sort((a, b) => b.maxUp - a.maxUp)
+                .map(({ g }) => g);
+            break;
+        case 'diff_down':
+            /* 지난주 대비 하락순: 변동없음 제외 + 최대 하락폭 내림차순 */
+            result = result
+                .map(g => {
+                    const diffs = g.rows.map(r => r.diffMid).filter(d => d !== null && d !== undefined);
+                    const maxDown = diffs.length ? Math.min(...diffs) : 0;
+                    return { g, maxDown };
+                })
+                .filter(({ maxDown }) => maxDown < 0)  /* 하락 있는 단지만 */
+                .sort((a, b) => a.maxDown - b.maxDown) /* 하락 많은 순 */
+                .map(({ g }) => g);
+            break;
+    }
+
+    filteredGroups = result;
+    renderInitial();
+}
+
+/* ════════════════════════════════════════════
+   HTML 생성
+════════════════════════════════════════════ */
+function getPriceRange(g) {
+    if (!g.minPrice && !g.maxPrice) return '';
+    if (g.minPrice === g.maxPrice) return g.minPrice.toLocaleString('ko-KR')+'만';
+    return `${g.minPrice.toLocaleString('ko-KR')} ~ ${g.maxPrice.toLocaleString('ko-KR')}만`;
+}
+
+/* 가격 변동 뱃지 생성 헬퍼 */
+function diffBadge(diff) {
+    if (diff === null || diff === undefined || diff === 0)
+        return `<span class="price-diff none">-</span>`;
+    const abs = Math.abs(diff).toLocaleString('ko-KR');
+    return diff > 0
+        ? `<span class="price-diff up">🔺${abs}</span>`
+        : `<span class="price-diff down">🔽${abs}</span>`;
+}
+
+function createGroupHTML(g) {
+    const priceRange = getPriceRange(g);
+
+    /* 규제지역 배지 + LTV 칩 (카드 헤더)
+       생애최초 모드: 규제지역도 LTV 70% 표시 */
+    const isRegCard = g.regZone === 'A' || g.regZone === 'B';
+    const ltvPct = (isRegCard && !activeFirstHome) ? 40 : 70;
+    const ltvChipCls = (isRegCard && activeFirstHome) ? 'ltv-chip ltv-70 ltv-first' : `ltv-chip ltv-${ltvPct}`;
+    const ltvChip = `<span class="${ltvChipCls}">LTV ${ltvPct}%${activeFirstHome && isRegCard ? ' <em class="ltv-fh-mark">생애최초</em>' : ''}</span>`;
+    const regBadge = g.regLabel
+        ? `<div class="reg-badges">
+               <span class="reg-badge reg-${g.regZone}">${g.regLabel}</span>
+               ${ltvChip}
+           </div>`
+        : `<div class="reg-badges">${ltvChip}</div>`;
+
+    // 그룹 내 변동 요약 (일반가 기준, 헤더에 표시)
+    const midDiffs = g.rows.map(r => r.diffMid).filter(d => d !== null && d !== 0);
+    let groupDiffBadge = '';
+    if (midDiffs.length > 0) {
+        const maxUp   = Math.max(...midDiffs.filter(d => d > 0), 0);
+        const maxDown = Math.min(...midDiffs.filter(d => d < 0), 0);
+        if (maxUp > 0 && maxDown < 0) {
+            groupDiffBadge = `<span class="group-diff-badge mixed">🔺🔽 등락</span>`;
+        } else if (maxUp > 0) {
+            groupDiffBadge = `<span class="group-diff-badge up">🔺${maxUp.toLocaleString('ko-KR')}</span>`;
+        } else if (maxDown < 0) {
+            groupDiffBadge = `<span class="group-diff-badge down">🔽${Math.abs(maxDown).toLocaleString('ko-KR')}</span>`;
+        }
+    }
+
+    let rowsHTML = '';
+    for (const row of g.rows) {
+        const sb = row.suffix ? `<span class="area-suffix">${row.suffix}</span>` : '';
+
+        /* 하한가 기준 대출 (1층 기준) */
+        const loanLow = getLoanLimit(row.하한가Raw, g.regZone, row.일반가Raw);
+        const loanLowBadge = loanLow
+            ? `<span class="loan-badge ${loanLow.cls}">대출 ${loanLow.amtStr}</span>`
+            : '';
+
+        /* 일반가 기준 대출 (일반층 기준) */
+        const loanMid = getLoanLimit(row.일반가Raw, g.regZone, row.일반가Raw);
+        const loanMidBadge = loanMid
+            ? `<span class="loan-badge ${loanMid.cls}">대출 ${loanMid.amtStr}</span>`
+            : '';
+
+        /* 대출 행 (풀폭, 3컬럼 아래 별도 배치) */
+        const loanRowHTML = (loanLow || loanMid) ? `
+            <div class="loan-info-row">
+                <span class="loan-info-label">대출 가능액 :</span>
+                <div class="loan-tags">
+                    ${loanLow ? `<span class="loan-tag ${loanLow.cls}"><em class="loan-tag-label">1층</em>${loanLow.amtStr}</span>` : ''}
+                    ${loanMid ? `<span class="loan-tag ${loanMid.cls}"><em class="loan-tag-label">일반</em>${loanMid.amtStr}</span>` : ''}
+                </div>
+            </div>` : '';
+
+        rowsHTML += `
+        <div class="inner-row">
+            <div class="inner-main">
+                <div class="inner-area">
+                    <span class="area-val u-sqm">${row.공급면적}㎡</span>
+                    <span class="area-divider u-sqm">/</span>
+                    <span class="area-val exclusive u-sqm">${row.전용면적}㎡</span>
+                    <span class="area-val u-pyeong">${row.공급평형}</span>
+                    <span class="area-divider u-pyeong">/</span>
+                    <span class="area-val exclusive u-pyeong">${row.전용평형}</span>
+                    ${sb}
+                </div>
+                <div class="inner-prices">
+                    <div class="price-box low">
+                        <span class="price-label">하한가</span>
+                        <span class="price-val">${row.하한가}</span>
+                        ${diffBadge(row.diffLow)}
+                    </div>
+                    <div class="price-box mid">
+                        <span class="price-label">일반가</span>
+                        <span class="price-val">${row.일반가}</span>
+                        ${diffBadge(row.diffMid)}
+                    </div>
+                    <div class="price-box high">
+                        <span class="price-label">상한가</span>
+                        <span class="price-val">${row.상한가}</span>
+                        ${diffBadge(row.diffHigh)}
+                    </div>
+                </div>
+            </div>
+            ${loanRowHTML}
+        </div>`;
+    }
+
+    const isFav = favSet.has(favKey(g));
+    const fKey  = favKey(g);
+    /* 공유 수신자 + 즐겨찾기 미포함이면 별표 숨김 */
+    const _showStar = !window._isShareRecipient || window._shareIncludeFavs;
+    const _starHTML = _showStar
+        ? `<button class="fav-star-btn${isFav?' active':''}"
+                data-fav-key="${fKey}"
+                title="${isFav?'즐겨찾기 해제':'즐겨찾기 추가'}"
+                type="button">${isFav?'⭐':'☆'}</button>`
+        : '';
+
+    return `
+    <div class="group-item${g.regZone?' has-reg zone-'+g.regZone:''}">
+        <div class="group-item-header">
+            ${_starHTML}
+            <div class="accordion-btn">
+                <div class="group-title-wrap">
+                    <span class="group-apt">${g.아파트}</span>
+                    <span class="group-region">${g.지역}</span>
+                    ${regBadge}
+                </div>
+                <div class="accordion-right">
+                    ${groupDiffBadge}
+                    ${priceRange?`<span class="price-range-badge">${priceRange}</span>`:''}
+                    <span class="row-count-badge">${g.rows.length}개</span>
+                    <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </div>
+            </div>
+        </div>
+        <div class="accordion-content">
+            <div class="content-header">
+                <span class="header-area">면적 (공급 / 전용)
+                    <span class="header-unit-badge u-sqm">㎡</span>
+                    <span class="header-unit-badge u-pyeong">평</span>
+                </span>
+                <span class="header-unit">(단위: 만원)</span>
+            </div>
+            ${rowsHTML}
+        </div>
+    </div>`;
+}
+
+/* ════════════════════════════════════════════
+   렌더링
+════════════════════════════════════════════ */
+function renderInitial(keepScroll) {
+    const listBody = document.getElementById('listBody');
+    const sentinel = document.getElementById('scrollSentinel');
+    const countEl  = document.getElementById('resultCount');
+
+    listBody.innerHTML = '';
+    loadedCount = 0;
+
+    const total = filteredGroups.length;
+    const isFiltered = activeRegion !== '전체' || activeFavOnly || document.getElementById('searchInput').value.trim() !== '';
+    if (countEl) {
+        countEl.textContent = isFiltered
+            ? `${total.toLocaleString()}개 단지`
+            : `전체 ${allGroups.length.toLocaleString()}개 단지`;
+    }
+
+    if (total === 0) {
+        listBody.innerHTML = `<div class="empty-state"><span class="empty-icon">🔍</span><p>조건에 맞는 시세 정보가 없습니다.</p><small>검색어 또는 지역 필터를 변경해보세요.</small></div>`;
+        sentinel.style.display = 'none';
+        return;
+    }
+
+    if (keepScroll) {
+        /* 스크롤 위치 유지 모드: 현재 scrollY를 커버할 만큼 충분히 로드
+           카드 평균 높이 ~120px 기준, 여유 있게 계산 */
+        const _estCount = Math.ceil((window.scrollY + window.innerHeight * 2) / 100) + LOAD_STEP;
+        const _need = Math.min(_estCount, filteredGroups.length);
+        while (loadedCount < _need) loadMore();
+    } else {
+        loadMore();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+}
+
+function loadMore() {
+    const listBody = document.getElementById('listBody');
+    const sentinel = document.getElementById('scrollSentinel');
+    const next  = Math.min(loadedCount + LOAD_STEP, filteredGroups.length);
+    const slice = filteredGroups.slice(loadedCount, next);
+    if (slice.length > 0) listBody.insertAdjacentHTML('beforeend', slice.map(createGroupHTML).join(''));
+    loadedCount = next;
+    sentinel.style.display = loadedCount >= filteredGroups.length ? 'none' : 'block';
+}
+
+function setupScrollObserver() {
+    const sentinel = document.getElementById('scrollSentinel');
+    scrollObserver = new IntersectionObserver(
+        entries => { if (entries[0].isIntersecting) loadMore(); },
+        { rootMargin: '300px' }
+    );
+    if (sentinel) scrollObserver.observe(sentinel);
+}
+
+/* ════════════════════════════════════════════
+   맨위로 버튼
+   ─────────────────────────────────────────────
+   - 페이지를 300px 이상 내리면 버튼이 나타남
+   - 버튼 클릭 시 페이지 상단으로 부드럽게 이동
+   - CSS .visible 클래스로 opacity/transform 전환
+════════════════════════════════════════════ */
+
+/** 스크롤 위치 기준값 (px): 이 값 이상 내려가면 버튼 표시 */
+const SCROLL_TOP_THRESHOLD = 300;
+
+/**
+ * setupScrollTopBtn
+ * DOMContentLoaded 이후 한 번 호출.
+ * scroll 이벤트에서 버튼 표시/숨김을 제어하고
+ * 클릭 시 window.scrollTo smooth 로 상단 이동.
+ */
+function setupScrollTopBtn() {
+    const btn = document.getElementById('scrollTopBtn');
+    if (!btn) return;
+
+    /* 스크롤 이벤트: 임계값 초과 시 버튼 노출 */
+    window.addEventListener('scroll', () => {
+        if (window.scrollY > SCROLL_TOP_THRESHOLD) {
+            btn.classList.add('visible');
+        } else {
+            btn.classList.remove('visible');
+        }
+    }, { passive: true }); /* passive: true → 스크롤 성능 최적화 */
+
+    /* 클릭 이벤트: 부드러운 상단 이동 */
+    btn.addEventListener('click', () => {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+}
+
+/* ════════════════════════════════════════════
+   임시 공유 링크 생성 & 모달
+   ────────────────────────────────────────────
+   ▶ 공유 수신자 (URL에 ?k= 토큰 보유)
+      공유 버튼 → 받은 링크 그대로 복사 (모달 없음)
+      → 두 사람 모두 동일 만료 시점에 접근 차단
+
+   ▶ 관리자 (검색창 "관리자" 입력으로 활성화)
+      공유 버튼 → 풀 모달 (기간 / 즐겨찾기 토글 / PWA 설치 토글)
+
+   ▶ 일반 오너 (관리자 아님 + 토큰 없음)
+      공유 버튼 → 현재 페이지 URL 복사만 수행 (모달 노출 X)
+      → 삼성 인터넷 등에서 모달 노출되던 문제 해결
+
+   ▶ 만료 문구: app_src.js 상단 SHARE_EXPIRED_MSG 수정
+════════════════════════════════════════════ */
+function setupShareBtn() {
+    const openBtn   = document.getElementById('shareBtnOpen');
+    const modal     = document.getElementById('shareModal');
+    const closeBtn  = document.getElementById('shareCloseBtn');
+    const genBtn    = document.getElementById('shareGenBtn');
+    const copyBtn   = document.getElementById('shareCopyBtn');
+    const linkInput = document.getElementById('shareLinkInput');
+    const resultBox = document.getElementById('shareResultBox');
+    const copyMsg   = document.getElementById('shareCopyMsg');
+    if (!openBtn) return;
+
+    /* ── 헬퍼: 안전한 클립보드 복사 (HTTPS / fallback 모두 지원) ── */
+    const safeCopy = async (text) => {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (_) {}
+        try {
+            const tmp = document.createElement('textarea');
+            tmp.value = text;
+            tmp.style.cssText = 'position:fixed;top:-9999px;opacity:0';
+            document.body.appendChild(tmp);
+            tmp.select();
+            document.execCommand('copy');
+            tmp.remove();
+            return true;
+        } catch (_) { return false; }
+    };
+
+    /* ── 헬퍼: 버튼 피드백 (텍스트/색상 일시 변경) ── */
+    const flashBtnFeedback = (label) => {
+        const span = openBtn.querySelector('span');
+        const orig = span ? span.textContent : '';
+        if (span) span.textContent = label;
+        openBtn.classList.add('flash-ok');
+        setTimeout(() => {
+            if (span) span.textContent = orig;
+            openBtn.classList.remove('flash-ok');
+        }, 1800);
+    };
+
+    /* ════ ① 공유 수신자 모드 ════
+       받은 링크를 그대로 복사. 관리자/일반 구분과 무관 */
+    if (window._isShareRecipient) {
+        openBtn.addEventListener('click', async () => {
+            const url = window._shareOrigUrl || location.href;
+            const ok = await safeCopy(url);
+            flashBtnFeedback(ok ? '복사됨!' : '복사 실패');
+        });
+        return;
+    }
+
+    /* ════ ② 비관리자 모드 (URL 토큰도 없고 관리자도 아닌 일반 방문자) ════
+       모달을 절대 노출하지 않고 현재 페이지 URL만 복사
+       → 삼성 인터넷·기타 브라우저에서 모달 노출되던 문제 근본 차단 */
+    if (!isAdmin()) {
+        openBtn.addEventListener('click', async () => {
+            /* 현재 location의 ?k 등 잔여 파라미터 제거 후 깔끔한 URL */
+            const u = new URL(location.href);
+            u.search = ''; u.hash = '';
+            u.pathname = u.pathname.replace(/\/index\.html$/, '/');
+            const ok = await safeCopy(u.toString());
+            flashBtnFeedback(ok ? '복사됨!' : '복사 실패');
+        });
+        return;
+    }
+
+    /* ════ ③ 관리자 모드 ════ */
+
+    /* 모달 열기 */
+    openBtn.addEventListener('click', () => {
+        modal.classList.add('open');
+        resultBox.style.display = 'none';
+        copyMsg.style.display   = 'none';
+    });
+
+    /* 모달 닫기 */
+    closeBtn.addEventListener('click', () => modal.classList.remove('open'));
+    modal.addEventListener('click', e => {
+        if (e.target === modal) modal.classList.remove('open');
+    });
+
+    /* 링크 생성 */
+    genBtn.addEventListener('click', async () => {
+        const dur  = Math.max(1, parseInt(document.getElementById('shareDuration').value) || 1);
+        const unit = parseInt(document.getElementById('shareUnit').value);
+        const exp  = Date.now() + dur * unit;
+
+        /* 즐겨찾기 기능 허용 여부 (오너 데이터 X, 수신자 기능 활성화 여부만) */
+        const _inclFav  = document.getElementById('shareFavToggle')?.checked || false;
+        /* PWA 설치 허용 여부 */
+        const _allowPwa = document.getElementById('sharePwaToggle')?.checked || false;
+
+        /* XOR 암호화 토큰 생성 (exp + includeFavs + allowPwa) */
+        const token = shareEncrypt({ exp, includeFavs: _inclFav, allowPwa: _allowPwa });
+
+        const baseUrl = new URL(location.href);
+        baseUrl.pathname = baseUrl.pathname.replace(/\/index\.html$/, '/');
+        baseUrl.search = '?' + SHARE_PARAM + '=' + token;
+        baseUrl.hash   = '';
+        const longUrl  = baseUrl.toString();
+
+        /* UI 초기 상태 */
+        resultBox.style.display = 'flex';
+        copyMsg.style.display   = 'none';
+        linkInput.value         = '링크 생성 중...';
+        copyBtn.disabled        = true;
+
+        const d = new Date(exp);
+        document.getElementById('shareExpLabel').textContent =
+            '만료: ' + d.toLocaleDateString('ko-KR') + ' ' +
+            d.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit' })
+            + (_allowPwa ? '  ·  📲 PWA 설치 허용' : '')
+            + (_inclFav  ? '  ·  ⭐ 즐겨찾기 허용'  : '');
+
+        /* URL 단축: is.gd → 실패 시 tinyurl 폴백 → 둘 다 실패 시 원본 */
+        let finalUrl = longUrl;
+        const shortenWith = async (api) => {
+            try {
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 4000);
+                const res = await fetch(api, { signal: ctrl.signal });
+                clearTimeout(tid);
+                const txt = (await res.text()).trim();
+                if (/^https?:\/\//.test(txt)) return txt;
+            } catch (_) {}
+            return null;
+        };
+        const short =
+            await shortenWith('https://is.gd/create.php?format=simple&url=' + encodeURIComponent(longUrl)) ||
+            await shortenWith('https://tinyurl.com/api-create.php?url=' + encodeURIComponent(longUrl));
+        if (short) finalUrl = short;
+
+        /* 공유 메시지 + URL 분리 저장 */
+        linkInput.value  = SHARE_COPY_TEMPLATE(finalUrl);
+        copyBtn.disabled = false;
+        const urlOnlyBtn = document.getElementById('shareUrlOnlyBtn');
+        if (urlOnlyBtn) urlOnlyBtn.dataset.url = finalUrl;
+        window._shareOrigUrl = finalUrl;
+    });
+
+    /* 메시지 전체 복사 */
+    copyBtn.addEventListener('click', async () => {
+        const ok = await safeCopy(linkInput.value);
+        copyMsg.textContent = ok
+            ? '✅ 클립보드에 복사됐습니다. 카카오톡 · 문자에 붙여넣기 하세요!'
+            : '❌ 복사 실패. 텍스트를 길게 눌러 직접 복사해 주세요.';
+        copyMsg.style.display = 'block';
+        setTimeout(() => { copyMsg.style.display = 'none'; }, 2500);
+    });
+
+    /* URL만 복사 */
+    document.getElementById('shareUrlOnlyBtn')?.addEventListener('click', async () => {
+        const urlBtn = document.getElementById('shareUrlOnlyBtn');
+        const url = urlBtn?.dataset.url || window._shareOrigUrl || '';
+        if (!url) return;
+        const ok = await safeCopy(url);
+        const orig = urlBtn.textContent;
+        urlBtn.textContent = ok ? '✅ 복사됨!' : '❌ 복사 실패';
+        setTimeout(() => { urlBtn.textContent = orig; }, 2000);
+    });
+}
+
+/* ════════════════════════════════════════════
+   공유 링크 프리뷰 페이지
+   ────────────────────────────────────────────
+   ▶ PREVIEW_SEC : 자동 이동 대기 시간(초)
+   ▶ 문구 수정   : spp-title / spp-desc 내 텍스트
+════════════════════════════════════════════ */
 const PREVIEW_SEC = 10;
+
 function showSharePreview() {
-const splash = document.getElementById('splashOverlay');
-if (!splash) { startApp(); return; }
-splash.classList.remove('hide');
-splash.style.opacity = '1';
-splash.style.visibility = 'visible';
-splash.innerHTML = `
-<div class="share-preview-page">
-<p class="spp-badge">임시 공유 링크</p>
-<div class="spp-icon">📊</div>
-<h2 class="spp-title">아파트 시세표</h2>
-<p class="spp-desc">
-Preview를 클릭하거나<br>
-<span id="shareCountdown">${PREVIEW_SEC}</span>초 뒤 페이지가<br>
-자동으로 이동됩니다.
-</p>
-<button id="sharePreviewBtn" class="spp-btn">Preview →</button>
-<p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
-</div>`;
-let started = false;
-const go = ()=>{
-if (started) return;
-started = true;
-clearInterval(timer);
-startApp();
-};
-let count = PREVIEW_SEC;
-const timer = setInterval(()=>{
-count--;
-const el = document.getElementById('shareCountdown');
-if (el) el.textContent = count;
-if (count<=0) go();
-}, 1000);
-document.getElementById('sharePreviewBtn')
-.addEventListener('click', go, { once: true });
+    const splash = document.getElementById('splashOverlay');
+    if (!splash) { startApp(); return; }
+
+    splash.classList.remove('hide');
+    splash.style.opacity    = '1';
+    splash.style.visibility = 'visible';
+
+    splash.innerHTML = `
+        <div class="share-preview-page">
+            <p class="spp-badge">임시 공유 링크</p>
+            <div class="spp-icon">📊</div>
+            <h2 class="spp-title">아파트  시세표</h2>
+            <p class="spp-desc">
+                Preview를 클릭하거나<br>
+                <span id="shareCountdown">${PREVIEW_SEC}</span>초 뒤 페이지가<br>
+                자동으로 이동됩니다.
+            </p>
+            <button id="sharePreviewBtn" class="spp-btn">Preview →</button>
+            <p class="spp-notice">⏱ 유효 기간이 있는 임시 링크입니다</p>
+        </div>`;
+
+    /* ── 이중 실행 방지 guard ── */
+    let started = false;
+    const go = () => {
+        if (started) return;
+        started = true;
+        clearInterval(timer);
+        startApp();
+    };
+
+    /* 카운트다운 */
+    let count = PREVIEW_SEC;
+    const timer = setInterval(() => {
+        count--;
+        const el = document.getElementById('shareCountdown');
+        if (el) el.textContent = count;
+        if (count <= 0) go();
+    }, 1000);
+
+    /* 버튼 once 옵션으로 중복 등록 방지 */
+    document.getElementById('sharePreviewBtn')
+        .addEventListener('click', go, { once: true });
 }
+
+/* 프리뷰 완료 후 실제 앱 시작 */
 function startApp() {
-_hS();
-_lD();
+    hideSplash();
+    loadData();
 }
-function _fK(g) { return `${g.지역}|${g.아파트}`; }
-function _lFav() {
-try {
-const raw = localStorage.getItem(_FK);
-_fS = new Set(raw ? JSON.parse(raw) : []);
-} catch { _fS = new Set(); }
+
+/* ════════════════════════════════════════════
+   즐겨찾기 유틸
+════════════════════════════════════════════ */
+function favKey(g) { return `${g.지역}|${g.아파트}`; }
+
+function loadFavorites() {
+    try {
+        const raw = localStorage.getItem(FAV_KEY);
+        favSet = new Set(raw ? JSON.parse(raw) : []);
+    } catch { favSet = new Set(); }
 }
-function _sFav() {
-try { localStorage.setItem(_FK, JSON.stringify([..._fS])); } catch {}
+
+function saveFavorites() {
+    /* 수신자도 자신의 기기 localStorage에 저장 (탭이 살아있는 한 유지) */
+    try { localStorage.setItem(FAV_KEY, JSON.stringify([...favSet])); } catch {}
 }
-function _lRS() {
-try {
-const raw = localStorage.getItem(_RK);
-_rS = raw ? JSON.parse(raw) : [];
-} catch { _rS = []; }
-_rRSU();
+
+/* ════════════════════════════════════════════
+   최근 검색어 유틸
+════════════════════════════════════════════ */
+function loadRecentSearches() {
+    try {
+        const raw = localStorage.getItem(RECENT_KEY);
+        recentSearches = raw ? JSON.parse(raw) : [];
+    } catch { recentSearches = []; }
+    renderRecentSearchUI();
 }
-function _sRS(term) {
-if (!term||term.length < 1) return;
-_rS = _rS.filter(t=>t!==term);
-_rS.unshift(term);
-if (_rS.length > _RM) _rS = _rS.slice(0, _RM);
-if (window._isShareRecipient) {
-try { sessionStorage.setItem('_shr_recent', JSON.stringify(_rS)); } catch {}
-} else {
-try { localStorage.setItem(_RK, JSON.stringify(_rS)); } catch {}
+
+function saveRecentSearch(term) {
+    if (!term || term.length < 1) return;
+    recentSearches = recentSearches.filter(t => t !== term);
+    recentSearches.unshift(term);
+    if (recentSearches.length > RECENT_MAX) recentSearches = recentSearches.slice(0, RECENT_MAX);
+    if (window._isShareRecipient) {
+        /* 수신자: sessionStorage만 (탭 격리 → 다른 사용자에게 절대 유출 안 됨) */
+        try { sessionStorage.setItem('_shr_recent', JSON.stringify(recentSearches)); } catch {}
+    } else {
+        try { localStorage.setItem(RECENT_KEY, JSON.stringify(recentSearches)); } catch {}
+    }
+    renderRecentSearchUI();
 }
-_rRSU();
+
+function removeRecentSearch(term) {
+    recentSearches = recentSearches.filter(t => t !== term);
+    if (window._isShareRecipient) {
+        try { sessionStorage.setItem('_shr_recent', JSON.stringify(recentSearches)); } catch {}
+    } else {
+        try { localStorage.setItem(RECENT_KEY, JSON.stringify(recentSearches)); } catch {}
+    }
+    renderRecentSearchUI();
 }
-function _rRS(term) {
-_rS = _rS.filter(t=>t!==term);
-if (window._isShareRecipient) {
-try { sessionStorage.setItem('_shr_recent', JSON.stringify(_rS)); } catch {}
-} else {
-try { localStorage.setItem(_RK, JSON.stringify(_rS)); } catch {}
+
+function renderRecentSearchUI() {
+    const container = document.getElementById('recentSearchWrap');
+    if (!container) return;
+
+    const searchInput = document.getElementById('searchInput');
+    const currentVal  = searchInput ? searchInput.value.trim() : '';
+
+    /* 입력 중이거나 최근 검색어 없으면 숨김 */
+    if (currentVal || recentSearches.length === 0) {
+        container.style.display = 'none';
+        return;
+    }
+
+    container.style.display = 'flex';
+    container.innerHTML = `
+        <span class="recent-label">최근 검색</span>
+        <div class="recent-chips">
+            ${recentSearches.map(t => `
+                <span class="recent-chip">
+                    <button class="recent-chip-text" data-term="${t}">${t}</button>
+                    <button class="recent-chip-del" data-del="${t}" aria-label="삭제">✕</button>
+                </span>`).join('')}
+        </div>`;
+
+    /* 클릭 이벤트 */
+    container.querySelectorAll('.recent-chip-text').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const inp = document.getElementById('searchInput');
+            if (inp) { inp.value = btn.dataset.term; }
+            applyFilters();
+            renderRecentSearchUI();
+        });
+    });
+    container.querySelectorAll('.recent-chip-del').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            removeRecentSearch(btn.dataset.del);
+        });
+    });
 }
-_rRSU();
+
+/* ════════════════════════════════════════════
+   투데이 방문자 카운터
+   ────────────────────────────────────────────
+   countapi.dev 무료 API 사용
+   키 형식: COUNT_NS / d-YYYYMMDD (일별 독립 카운트)
+   localStorage: 같은 브라우저의 당일 중복 카운트 방지
+════════════════════════════════════════════ */
+
+function getTodayKey() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return 'd-' + y + m + day; // 예: d-20260408
 }
-function _rRSU() {
-const container = document.getElementById('recentSearchWrap');
-if (!container) return;
-const searchInput = document.getElementById('searchInput');
-const currentVal = searchInput ? searchInput.value.trim() : '';
-if (currentVal||_rS.length===0) {
-container.style.display = 'none';
-return;
+
+/* 페이지 로드 시 1회 hit
+   isRecipient=false → 오너(직접): d-YYYYMMDD 키, localStorage 중복 방지
+   isRecipient=true  → 수신자(공유): s-YYYYMMDD 키, sessionStorage 중복 방지 (탭 격리)
+*/
+async function trackTodayVisit(isRecipient) {
+    if (!FIREBASE_URL) return; // Firebase URL 미설정 시 스킵
+
+    const dateKey = getTodayKey();
+    const apiKey  = isRecipient ? 's-' + dateKey.slice(2) : dateKey;
+
+    /* 중복 방지: 오너 → localStorage, 수신자 → sessionStorage */
+    const dupKey  = '_today_hit_' + apiKey;
+    const storage = isRecipient ? sessionStorage : localStorage;
+    if (storage.getItem(dupKey)) return;
+
+    try {
+        /* Firebase Realtime Database Transaction
+           GET 현재값 → +1 → PUT 새 값 */
+        const path = `${FIREBASE_URL}/${COUNT_NS}/${apiKey}.json`;
+        const cur  = await fetch(path).then(r => r.json()).catch(() => 0);
+        const next = (typeof cur === 'number' ? cur : 0) + 1;
+        const res  = await fetch(path, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(next),
+        });
+        if (res.ok) {
+            storage.setItem(dupKey, '1');
+            if (!isRecipient) cleanOldHitKeys();
+        }
+    } catch (_) {}
 }
-container.style.display = 'flex';
-container.innerHTML = `
-<span class="recent-label">최근 검색</span>
-<div class="recent-chips">
-${_rS.map(t=>`
-<span class="recent-chip">
-<button class="recent-chip-text" data-term="${t}">${t}</button>
-<button class="recent-chip-del" data-del="${t}" aria-label="삭제">✕</button>
-</span>`).join('')}
-</div>`;
-container.querySelectorAll('.recent-chip-text').forEach(btn=>{
-btn.addEventListener('click', ()=>{
-const inp = document.getElementById('searchInput');
-if (inp) { inp.value = btn.dataset.term; }
-_aF();
-_rRSU();
-});
-});
-container.querySelectorAll('.recent-chip-del').forEach(btn=>{
-btn.addEventListener('click', (e)=>{
-e.stopPropagation();
-_rRS(btn.dataset.del);
-});
-});
+
+/* localStorage에서 오래된 _today_hit_ 키 정리 */
+function cleanOldHitKeys() {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 30);
+    const cutStr = cutoff.getFullYear()
+        + String(cutoff.getMonth()+1).padStart(2,'0')
+        + String(cutoff.getDate()).padStart(2,'0');
+    Object.keys(localStorage).forEach(k => {
+        if (k.startsWith('_today_hit_d-')) {
+            const dateStr = k.replace('_today_hit_d-', '');
+            if (dateStr < cutStr) localStorage.removeItem(k);
+        }
+    });
 }
-function _gTK() {
-const d = new Date();
-const y = d.getFullYear();
-const m = String(d.getMonth() + 1).padStart(2, '0');
-const day = String(d.getDate()).padStart(2, '0');
-return 'd-' + y + m + day; // 예: d-20260408
+
+/* 투데이 팝업 — 직접/공유 분리 표시 */
+async function showTodayVisitorPopup() {
+    document.getElementById('todayPopup')?.remove();
+
+    const popup = document.createElement('div');
+    popup.id = 'todayPopup';
+    popup.className = 'today-popup';
+    popup.innerHTML = `
+        <div class="tp-header">
+            <span class="tp-title">📊 오늘 방문자</span>
+            <button class="tp-close" onclick="document.getElementById('todayPopup')?.remove()">✕</button>
+        </div>
+        <div class="tp-body">
+            <div class="tp-rows">
+                <div class="tp-row">
+                    <span class="tp-label">🏠 직접 접속</span>
+                    <span class="tp-val" id="tpDirect"><span class="tp-spinner-sm"></span></span>
+                </div>
+                <div class="tp-divider"></div>
+                <div class="tp-row">
+                    <span class="tp-label">🔗 공유 링크</span>
+                    <span class="tp-val" id="tpShare"><span class="tp-spinner-sm"></span></span>
+                </div>
+                <div class="tp-divider"></div>
+                <div class="tp-row tp-row-total">
+                    <span class="tp-label">합계</span>
+                    <span class="tp-val tp-total" id="tpTotal">-</span>
+                </div>
+            </div>
+            <p class="tp-date">${new Date().toLocaleDateString('ko-KR')} 기준</p>
+            <p class="tp-hint">같은 브라우저 당일 중복 집계 제외</p>
+        </div>`;
+    document.body.appendChild(popup);
+
+    /* 외부 클릭 닫기 */
+    setTimeout(() => {
+        document.addEventListener('click', function _close(e) {
+            if (!popup.contains(e.target)) {
+                popup.remove();
+                document.removeEventListener('click', _close);
+            }
+        });
+    }, 200);
+
+    /* 직접/공유 API 병렬 조회 */
+    const dateKey   = getTodayKey();
+    const directKey = dateKey;                  // d-YYYYMMDD
+    const shareKey  = 's-' + dateKey.slice(2); // s-YYYYMMDD
+
+    if (!FIREBASE_URL) {
+        /* Firebase 미설정 시 안내 표시 */
+        const elD = document.getElementById('tpDirect');
+        const elS = document.getElementById('tpShare');
+        const elT = document.getElementById('tpTotal');
+        if (elD) elD.innerHTML = '<span class="tp-err">설정 필요</span>';
+        if (elS) elS.innerHTML = '<span class="tp-err">설정 필요</span>';
+        if (elT) elT.innerHTML = '<span class="tp-err" style="font-size:0.7rem">FIREBASE_URL을 설정하세요</span>';
+        return;
+    }
+
+    const fetchCount = async (key) => {
+        try {
+            const res = await fetch(`${FIREBASE_URL}/${COUNT_NS}/${key}.json`);
+            const val = await res.json();
+            return typeof val === 'number' ? val : 0;
+        } catch (_) { return null; }
+    };
+
+    const fmt = (n) => n === null
+        ? '<span class="tp-err">-</span>'
+        : `<span class="tp-num-sm">${Number(n).toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
+
+    const [direct, share] = await Promise.all([
+        fetchCount(directKey),
+        fetchCount(shareKey),
+    ]);
+
+    const elD = document.getElementById('tpDirect');
+    const elS = document.getElementById('tpShare');
+    const elT = document.getElementById('tpTotal');
+    if (elD) elD.innerHTML = fmt(direct);
+    if (elS) elS.innerHTML = fmt(share);
+    if (elT) {
+        const total = (direct ?? 0) + (share ?? 0);
+        elT.innerHTML = `<span class="tp-num-sm tp-total-num">${total.toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
+    }
 }
-async function _tTV(isRecipient) {
-if (!_FBU) return; // Firebase URL 미설정 시 스킵
-const dateKey = _gTK();
-const apiKey = isRecipient ? 's-' + dateKey.slice(2) : dateKey;
-const dupKey = '_today_hit_' + apiKey;
-const storage = isRecipient ? sessionStorage : localStorage;
-if (storage.getItem(dupKey)) return;
-try {
-const path = `${_FBU}/${_CNS}/${apiKey}.json`;
-const cur = await fetch(path).then(r=>r.json()).catch(()=>0);
-const next = (typeof cur==='number' ? cur : 0) + 1;
-const res = await fetch(path, {
-method: 'PUT',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify(next),
-});
-if (res.ok) {
-storage.setItem(dupKey, '1');
-if (!isRecipient) _cOHK();
+
+/* ════════════════════════════════════════════
+   푸시 알림 권한 요청
+   ────────────────────────────────────────────
+   - 최초 1회만 요청 (denied 시 재요청 안 함)
+   - PWA 설치자(오너)만 호출됨
+════════════════════════════════════════════ */
+async function requestNotificationPermission() {
+    if (!('Notification' in window)) return;          // 미지원 브라우저
+    if (Notification.permission === 'granted') return; // 이미 허용
+    if (Notification.permission === 'denied')  return; // 이미 거부
+
+    /* 허용 요청 */
+    try {
+        const result = await Notification.requestPermission();
+        console.log('[알림]', result);
+    } catch (_) {}
 }
-} catch (_) {}
+
+/* ════════════════════════════════════════════
+   CSV 업데이트 인앱 배너
+   ────────────────────────────────────────────
+   SW가 CSV 변경을 감지하면 앱 상단에 배너 표시.
+   클릭 시 페이지 새로고침 (새 CSV 로드).
+════════════════════════════════════════════ */
+function showCsvUpdateBanner() {
+    /* 이미 표시 중이면 무시 */
+    if (document.getElementById('csvUpdateBanner')) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'csvUpdateBanner';
+    banner.className = 'csv-update-banner';
+    banner.innerHTML = `
+        <span class="cub-icon">📊</span>
+        <span class="cub-msg">새로운 시세 데이터가 업로드되었습니다.</span>
+        <button class="cub-btn" id="cubRefreshBtn">새로고침</button>
+        <button class="cub-close" id="cubCloseBtn" aria-label="닫기">✕</button>`;
+    document.body.prepend(banner);
+
+    /* 애니메이션 후 표시 */
+    requestAnimationFrame(() => banner.classList.add('visible'));
+
+    document.getElementById('cubRefreshBtn').addEventListener('click', () => {
+        banner.remove();
+        window.location.reload(true);
+    });
+    document.getElementById('cubCloseBtn').addEventListener('click', () => {
+        banner.classList.remove('visible');
+        setTimeout(() => banner.remove(), 300);
+    });
+
+    /* 15초 후 자동 닫기 */
+    setTimeout(() => {
+        if (document.getElementById('csvUpdateBanner')) {
+            banner.classList.remove('visible');
+            setTimeout(() => banner.remove(), 300);
+        }
+    }, 15000);
 }
-function _cOHK() {
-const cutoff = new Date();
-cutoff.setDate(cutoff.getDate() - 30);
-const cutStr = cutoff.getFullYear()
-+ String(cutoff.getMonth()+1).padStart(2,'0')
-+ String(cutoff.getDate()).padStart(2,'0');
-Object.keys(localStorage).forEach(k=>{
-if (k.startsWith('_today_hit_d-')) {
-const dateStr = k.replace('_today_hit_d-', '');
-if (dateStr < cutStr) localStorage.removeItem(k);
-}
-});
-}
-async function _sTVP() {
-document.getElementById('todayPopup')?.remove();
-const popup = document.createElement('div');
-popup.id = 'todayPopup';
-popup.className = 'today-popup';
-popup.innerHTML = `
-<div class="tp-header">
-<span class="tp-title">📊 오늘 방문자</span>
-<button class="tp-close" onclick="document.getElementById('todayPopup')?.remove()">✕</button>
-</div>
-<div class="tp-body">
-<div class="tp-rows">
-<div class="tp-row">
-<span class="tp-label">🏠 직접 접속</span>
-<span class="tp-val" id="tpDirect"><span class="tp-spinner-sm"></span></span>
-</div>
-<div class="tp-divider"></div>
-<div class="tp-row">
-<span class="tp-label">🔗 공유 링크</span>
-<span class="tp-val" id="tpShare"><span class="tp-spinner-sm"></span></span>
-</div>
-<div class="tp-divider"></div>
-<div class="tp-row tp-row-total">
-<span class="tp-label">합계</span>
-<span class="tp-val tp-total" id="tpTotal">-</span>
-</div>
-</div>
-<p class="tp-date">${new Date().toLocaleDateString('ko-KR')} 기준</p>
-<p class="tp-hint">같은 브라우저 당일 중복 집계 제외</p>
-</div>`;
-document.body.appendChild(popup);
-setTimeout(()=>{
-document.addEventListener('click', function _close(e) {
-if (!popup.contains(e.target)) {
-popup.remove();
-document.removeEventListener('click', _close);
-}
-});
-}, 200);
-const dateKey = _gTK();
-const directKey = dateKey; // d-YYYYMMDD
-const shareKey = 's-' + dateKey.slice(2); // s-YYYYMMDD
-if (!_FBU) {
-const elD = document.getElementById('tpDirect');
-const elS = document.getElementById('tpShare');
-const elT = document.getElementById('tpTotal');
-if (elD) elD.innerHTML = '<span class="tp-err">설정 필요</span>';
-if (elS) elS.innerHTML = '<span class="tp-err">설정 필요</span>';
-if (elT) elT.innerHTML = '<span class="tp-err" style="font-size:0.7rem">_FBU을 설정하세요</span>';
-return;
-}
-const fetchCount = async (key)=>{
-try {
-const res = await fetch(`${_FBU}/${_CNS}/${key}.json`);
-const val = await res.json();
-return typeof val==='number' ? val : 0;
-} catch (_) { return null; }
-};
-const fmt = (n)=>n===null
-? '<span class="tp-err">-</span>'
-: `<span class="tp-num-sm">${Number(n).toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
-const [direct, share] = await Promise.all([
-fetchCount(directKey),
-fetchCount(shareKey),
-]);
-const elD = document.getElementById('tpDirect');
-const elS = document.getElementById('tpShare');
-const elT = document.getElementById('tpTotal');
-if (elD) elD.innerHTML = fmt(direct);
-if (elS) elS.innerHTML = fmt(share);
-if (elT) {
-const total = (direct ?? 0) + (share ?? 0);
-elT.innerHTML = `<span class="tp-num-sm tp-total-num">${total.toLocaleString('ko-KR')}</span><span class="tp-unit-sm">명</span>`;
-}
-}
-async function _rNP() {
-if (!('Notification' in window)) return; // 미지원 브라우저
-if (Notification.permission==='granted') return; // 이미 허용
-if (Notification.permission==='denied') return; // 이미 거부
-try {
-const result = await Notification.requestPermission();
-console.log('[알림]', result);
-} catch (_) {}
-}
-function _sCUB() {
-if (document.getElementById('csvUpdateBanner')) return;
-const banner = document.createElement('div');
-banner.id = 'csvUpdateBanner';
-banner.className = 'csv-update-banner';
-banner.innerHTML = `
-<span class="cub-icon">📊</span>
-<span class="cub-msg">새로운 시세 데이터가 업로드되었습니다.</span>
-<button class="cub-btn" id="cubRefreshBtn">새로고침</button>
-<button class="cub-close" id="cubCloseBtn" aria-label="닫기">✕</button>`;
-document.body.prepend(banner);
-requestAnimationFrame(()=>banner.classList.add('visible'));
-document.getElementById('cubRefreshBtn').addEventListener('click', ()=>{
-banner.remove();
-window.location.reload(true);
-});
-document.getElementById('cubCloseBtn').addEventListener('click', ()=>{
-banner.classList.remove('visible');
-setTimeout(()=>banner.remove(), 300);
-});
-setTimeout(()=>{
-if (document.getElementById('csvUpdateBanner')) {
-banner.classList.remove('visible');
-setTimeout(()=>banner.remove(), 300);
-}
-}, 15000);
-}
+
+/* ════════════════════════════════════════════
+   Web Push 알림 시스템
+   ────────────────────────────────────────────
+   PWA 설치자 전용. 검색창에 아래 키워드 입력 가능:
+     '알림구독' → 알림 권한 요청 + 구독
+     '알림전송' → 전체 구독자에게 알림 발송 (오너용)
+════════════════════════════════════════════ */
+
+/* PWA 설치 여부 확인 */
 function isPWAInstalled() {
-return window.matchMedia('(display-mode: standalone)').matches
-|| window.navigator.standalone===true;
+    return window.matchMedia('(display-mode: standalone)').matches
+        || window.navigator.standalone === true;
 }
+
+/* 초기화: 이미 구독 완료면 스킵, 미구독이면 배너 표시 */
 async function setupPushNotification() {
-if (!PUSH_WORKER_URL) return; // Worker URL 미설정 시 스킵
-if (!('Notification' in window)||!('serviceWorker' in navigator)||!('PushManager' in window)) return;
-if (Notification.permission==='granted') {
-try {
-const reg = await navigator.serviceWorker.ready;
-const sub = await reg.pushManager.getSubscription();
-if (sub) {
-await refreshSubscription(sub); // 서버에 재등록
-return;
+    if (!PUSH_WORKER_URL) return; // Worker URL 미설정 시 스킵
+    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+    /* 이미 권한 허용 + 구독됨 → 구독 갱신 (만료 방지) */
+    if (Notification.permission === 'granted') {
+        try {
+            const reg = await navigator.serviceWorker.ready;
+            const sub = await reg.pushManager.getSubscription();
+            if (sub) {
+                await refreshSubscription(sub); // 서버에 재등록
+                return;
+            }
+        } catch (_) {}
+    }
+
+    /* 권한 미결정이면 배너 표시 */
+    if (Notification.permission === 'default') {
+        showPushBanner();
+    }
 }
-} catch (_) {}
-}
-if (Notification.permission==='default') {
-showPushBanner();
-}
-}
+
+/* 알림 허용 배너 */
 function showPushBanner() {
-if (document.getElementById('pushBanner')) return;
-const banner = document.createElement('div');
-banner.id = 'pushBanner';
-banner.className = 'push-banner';
-banner.innerHTML = `
-<div class="pb-content">
-<span class="pb-icon">🔔</span>
-<div class="pb-text">
-<strong>시세 업데이트 알림</strong>
-<span>새 데이터 등록 시 알림을 받아보세요</span>
-</div>
-</div>
-<div class="pb-actions">
-<button class="pb-allow" id="pbAllow">허용</button>
-<button class="pb-deny" id="pbDeny">닫기</button>
-</div>`;
-document.body.appendChild(banner);
-setTimeout(()=>banner.classList.add('visible'), 100);
-document.getElementById('pbAllow').addEventListener('click', async ()=>{
-banner.remove();
-await requestPushPermission();
-});
-document.getElementById('pbDeny').addEventListener('click', ()=>{
-banner.classList.remove('visible');
-setTimeout(()=>banner.remove(), 300);
-localStorage.setItem('_push_denied', Date.now()); // 7일간 재표시 안 함
-});
+    if (document.getElementById('pushBanner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'pushBanner';
+    banner.className = 'push-banner';
+    banner.innerHTML = `
+        <div class="pb-content">
+            <span class="pb-icon">🔔</span>
+            <div class="pb-text">
+                <strong>시세 업데이트 알림</strong>
+                <span>새 데이터 등록 시 알림을 받아보세요</span>
+            </div>
+        </div>
+        <div class="pb-actions">
+            <button class="pb-allow" id="pbAllow">허용</button>
+            <button class="pb-deny"  id="pbDeny">닫기</button>
+        </div>`;
+    document.body.appendChild(banner);
+
+    setTimeout(() => banner.classList.add('visible'), 100);
+
+    document.getElementById('pbAllow').addEventListener('click', async () => {
+        banner.remove();
+        await requestPushPermission();
+    });
+    document.getElementById('pbDeny').addEventListener('click', () => {
+        banner.classList.remove('visible');
+        setTimeout(() => banner.remove(), 300);
+        localStorage.setItem('_push_denied', Date.now()); // 7일간 재표시 안 함
+    });
 }
+
+/* 알림 권한 요청 + 구독 */
 async function requestPushPermission() {
-if (!PUSH_WORKER_URL) {
-alert('Push Worker URL이 설정되지 않았습니다.\napp_src.js의 PUSH_WORKER_URL을 설정해 주세요.');
-return;
+    if (!PUSH_WORKER_URL) {
+        alert('Push Worker URL이 설정되지 않았습니다.\napp_src.js의 PUSH_WORKER_URL을 설정해 주세요.');
+        return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') {
+        alert('알림 권한이 거부되었습니다.\n브라우저 설정에서 알림을 허용해 주세요.');
+        return;
+    }
+    const ok = await subscribeWebPush();
+    if (ok) {
+        showToast('🔔 알림이 등록되었습니다!');
+    } else {
+        showToast('❌ 알림 등록에 실패했습니다. 잠시 후 다시 시도해 주세요.');
+    }
 }
-const perm = await Notification.requestPermission();
-if (perm!=='granted') {
-alert('알림 권한이 거부되었습니다.\n브라우저 설정에서 알림을 허용해 주세요.');
-return;
-}
-const ok = await subscribeWebPush();
-if (ok) {
-showToast('🔔 알림이 등록되었습니다!');
-} else {
-showToast('❌ 알림 등록에 실패했습니다. 잠시 후 다시 시도해 주세요.');
-}
-}
+
+/* Web Push 구독 실행 */
 async function subscribeWebPush() {
-try {
-const keyRes = await fetch(`${PUSH_WORKER_URL}/vapid-key`);
-const { publicKey } = await keyRes.json();
-const vapidKey = base64urlToUint8(publicKey);
-const reg = await navigator.serviceWorker.ready;
-const sub = await reg.pushManager.subscribe({
-userVisibleOnly: true,
-applicationServerKey: vapidKey
-});
-return await refreshSubscription(sub);
-} catch (e) {
-console.error('[Push] 구독 실패', e);
-return false;
+    try {
+        /* Worker에서 VAPID 공개키 조회 */
+        const keyRes  = await fetch(`${PUSH_WORKER_URL}/vapid-key`);
+        const { publicKey } = await keyRes.json();
+
+        /* applicationServerKey 변환 (base64url → Uint8Array) */
+        const vapidKey = base64urlToUint8(publicKey);
+
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: vapidKey
+        });
+
+        return await refreshSubscription(sub);
+    } catch (e) {
+        console.error('[Push] 구독 실패', e);
+        return false;
+    }
 }
-}
+
+/* 구독 정보를 Worker에 등록/갱신 */
 async function refreshSubscription(sub) {
-try {
-const res = await fetch(`${PUSH_WORKER_URL}/subscribe`, {
-method: 'POST',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify(sub.toJSON())
-});
-const data = await res.json();
-return !!data.ok;
-} catch (_) { return false; }
+    try {
+        const res = await fetch(`${PUSH_WORKER_URL}/subscribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(sub.toJSON())
+        });
+        const data = await res.json();
+        return !!data.ok;
+    } catch (_) { return false; }
 }
+
+/* 관리자: 알림 발송 패널 */
 async function showPushAdminPanel() {
-if (!PUSH_ADMIN_KEY||!PUSH_WORKER_URL) {
-alert('PUSH_WORKER_URL 또는 PUSH_ADMIN_KEY가 설정되지 않았습니다.');
-return;
+    if (!PUSH_ADMIN_KEY || !PUSH_WORKER_URL) {
+        alert('PUSH_WORKER_URL 또는 PUSH_ADMIN_KEY가 설정되지 않았습니다.');
+        return;
+    }
+
+    /* 구독자 수 조회 */
+    let subCount = '...';
+    try {
+        const r = await fetch(`${PUSH_WORKER_URL}/count`);
+        const d = await r.json();
+        subCount = d.count ?? '?';
+    } catch (_) {}
+
+    /* 기존 패널 제거 */
+    document.getElementById('pushAdminPanel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'pushAdminPanel';
+    panel.className = 'push-admin-panel';
+    panel.innerHTML = `
+        <div class="pap-header">
+            <span class="pap-title">📢 알림 발송</span>
+            <button class="pap-close" id="papClose">✕</button>
+        </div>
+        <div class="pap-body">
+            <div class="pap-stat">
+                <span>구독자</span>
+                <strong id="papCount">${subCount}명</strong>
+            </div>
+            <input type="text" id="papTitle" class="pap-input" placeholder="제목 (기본: KB 아파트 시세표)" maxlength="50">
+            <textarea id="papMsg" class="pap-textarea" rows="3"
+                placeholder="알림 내용 (기본: 새로운 아파트 시세가 업데이트되었습니다!)"
+                maxlength="200"></textarea>
+            <button class="pap-send-btn" id="papSend">🔔 전체 발송</button>
+            <div class="pap-result" id="papResult"></div>
+        </div>`;
+    document.body.appendChild(panel);
+
+    /* 닫기 */
+    const close = () => panel.remove();
+    document.getElementById('papClose').addEventListener('click', close);
+    setTimeout(() => {
+        document.addEventListener('click', function _c(e) {
+            if (!panel.contains(e.target)) { close(); document.removeEventListener('click', _c); }
+        });
+    }, 200);
+
+    /* 발송 */
+    document.getElementById('papSend').addEventListener('click', async () => {
+        const title   = document.getElementById('papTitle').value.trim()
+                      || 'KB 아파트 시세표';
+        const message = document.getElementById('papMsg').value.trim()
+                      || '새로운 아파트 시세가 업데이트되었습니다!';
+        const btn = document.getElementById('papSend');
+        const res = document.getElementById('papResult');
+        btn.disabled = true;
+        btn.textContent = '발송 중...';
+        try {
+            const r = await fetch(`${PUSH_WORKER_URL}/notify`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${PUSH_ADMIN_KEY}`
+                },
+                body: JSON.stringify({ title, message })
+            });
+            const d = await r.json();
+            res.textContent = `✅ 발송 완료: ${d.sent}/${d.total}명 성공`;
+        } catch (e) {
+            res.textContent = '❌ 발송 실패. 네트워크를 확인해 주세요.';
+        }
+        btn.disabled = false;
+        btn.textContent = '🔔 전체 발송';
+    });
 }
-let subCount = '...';
-try {
-const r = await fetch(`${PUSH_WORKER_URL}/count`);
-const d = await r.json();
-subCount = d.count ?? '?';
-} catch (_) {}
-document.getElementById('pushAdminPanel')?.remove();
-const panel = document.createElement('div');
-panel.id = 'pushAdminPanel';
-panel.className = 'push-admin-panel';
-panel.innerHTML = `
-<div class="pap-header">
-<span class="pap-title">📢 알림 발송</span>
-<button class="pap-close" id="papClose">✕</button>
-</div>
-<div class="pap-body">
-<div class="pap-stat">
-<span>구독자</span>
-<strong id="papCount">${subCount}명</strong>
-</div>
-<input type="text" id="papTitle" class="pap-input" placeholder="제목 (기본: KB 아파트 시세표)" maxlength="50">
-<textarea id="papMsg" class="pap-textarea" rows="3"
-placeholder="알림 내용 (기본: 새로운 아파트 시세가 업데이트되었습니다!)"
-maxlength="200"></textarea>
-<button class="pap-send-btn" id="papSend">🔔 전체 발송</button>
-<div class="pap-result" id="papResult"></div>
-</div>`;
-document.body.appendChild(panel);
-const close = ()=>panel.remove();
-document.getElementById('papClose').addEventListener('click', close);
-setTimeout(()=>{
-document.addEventListener('click', function _c(e) {
-if (!panel.contains(e.target)) { close(); document.removeEventListener('click', _c); }
-});
-}, 200);
-document.getElementById('papSend').addEventListener('click', async ()=>{
-const title = document.getElementById('papTitle').value.trim()
-|| 'KB 아파트 시세표';
-const message = document.getElementById('papMsg').value.trim()
-|| '새로운 아파트 시세가 업데이트되었습니다!';
-const btn = document.getElementById('papSend');
-const res = document.getElementById('papResult');
-btn.disabled = true;
-btn.textContent = '발송 중...';
-try {
-const r = await fetch(`${PUSH_WORKER_URL}/notify`, {
-method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-'Authorization': `Bearer ${PUSH_ADMIN_KEY}`
-},
-body: JSON.stringify({ title, message })
-});
-const d = await r.json();
-res.textContent = `✅ 발송 완료: ${d.sent}/${d.total}명 성공`;
-} catch (e) {
-res.textContent = '❌ 발송 실패. 네트워크를 확인해 주세요.';
-}
-btn.disabled = false;
-btn.textContent = '🔔 전체 발송';
-});
-}
+
+/* 토스트 메시지 */
 function showToast(msg) {
-const t = document.createElement('div');
-t.className = 'apt-toast';
-t.textContent = msg;
-document.body.appendChild(t);
-setTimeout(()=>t.classList.add('visible'), 50);
-setTimeout(()=>{ t.classList.remove('visible'); setTimeout(()=>t.remove(), 350); }, 3000);
+    const t = document.createElement('div');
+    t.className = 'apt-toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.classList.add('visible'), 50);
+    setTimeout(() => { t.classList.remove('visible'); setTimeout(() => t.remove(), 350); }, 3000);
 }
+
+/* base64url → Uint8Array */
 function base64urlToUint8(b64u) {
-const b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
-const raw = atob(b64.padEnd(b64.length + (4 - b64.length % 4) % 4, '='));
-return Uint8Array.from(raw, c=>c.charCodeAt(0));
+    const b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(b64.padEnd(b64.length + (4 - b64.length % 4) % 4, '='));
+    return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+/* ════════════════════════════════════════════
+   관리자 배지 (오너 + 관리자 모드 ON 시 표시)
+   ────────────────────────────────────────────
+   - 우상단에 작은 "👑 관리자" 칩 노출
+   - 클릭 시 빠른 해제 (확인 후 setAdmin(false))
+════════════════════════════════════════════ */
+function showAdminBadge() {
+    if (document.getElementById('adminBadge')) return;
+    const b = document.createElement('button');
+    b.id = 'adminBadge';
+    b.className = 'admin-badge';
+    b.type = 'button';
+    b.title = '관리자 모드 — 클릭 시 해제';
+    b.innerHTML = '<span class="ab-crown">👑</span><span class="ab-text">관리자</span>';
+    b.addEventListener('click', () => {
+        if (confirm('관리자 모드를 해제하시겠습니까?')) {
+            setAdmin(false);
+            hideAdminBadge();
+            showToast('관리자 모드를 해제했습니다');
+            /* 공유 버튼 핸들러 재바인딩 — 이번 세션에 즉시 반영하려면 새로고침 권장 */
+            setTimeout(() => location.reload(), 600);
+        }
+    });
+    document.body.appendChild(b);
+    requestAnimationFrame(() => b.classList.add('visible'));
+}
+
+function hideAdminBadge() {
+    const b = document.getElementById('adminBadge');
+    if (!b) return;
+    b.classList.remove('visible');
+    setTimeout(() => b.remove(), 250);
+}
+
+/* ════════════════════════════════════════════
+   PWA 설치 안내 카드 (공유 수신자 + 토큰 allowPwa=true)
+   ────────────────────────────────────────────
+   - 최초 1회만 표시 (sessionStorage 가드는 호출 측에서 처리)
+   - iOS: beforeinstallprompt 미지원 → "공유 → 홈 화면에 추가" 텍스트 안내
+   - Android Chrome: deferredPrompt.prompt() 호출
+   - 이미 설치된 경우(standalone) 표시 안 함
+════════════════════════════════════════════ */
+function showPwaInstallPromptForRecipient() {
+    /* 이미 설치돼 standalone으로 열린 상태면 안내 불필요 */
+    if (window.matchMedia('(display-mode: standalone)').matches
+        || window.navigator.standalone === true) return;
+
+    if (document.getElementById('pwaInstallCard')) return;
+
+    /* 플랫폼 감지 */
+    const ua = navigator.userAgent;
+    const isIOS    = /iPad|iPhone|iPod/.test(ua) && !window.MSStream;
+    const isSafari = isIOS && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua);
+    /* 삼성 인터넷도 Chromium 기반이라 deferredPrompt 사용 가능 */
+    const canPrompt = !!window._deferredInstallPrompt;
+
+    const card = document.createElement('div');
+    card.id = 'pwaInstallCard';
+    card.className = 'pwa-install-card';
+
+    let actionHTML = '';
+    if (canPrompt) {
+        actionHTML = `
+            <button class="pic-btn pic-btn-install" id="picInstall">📲 홈 화면에 설치</button>
+            <button class="pic-btn pic-btn-later"   id="picLater">나중에</button>`;
+    } else if (isIOS && isSafari) {
+        actionHTML = `
+            <p class="pic-ios-guide">
+                Safari 하단 <b>공유 버튼 <span class="pic-ios-icon">⬆︎</span></b> →
+                <b>"홈 화면에 추가"</b> 를 눌러주세요
+            </p>
+            <button class="pic-btn pic-btn-later" id="picLater">닫기</button>`;
+    } else {
+        /* 비-iOS인데 deferredPrompt 없음 → 브라우저 메뉴 안내 */
+        actionHTML = `
+            <p class="pic-ios-guide">
+                브라우저 메뉴 → <b>"홈 화면에 추가"</b> 또는 <b>"앱 설치"</b> 를 선택해주세요
+            </p>
+            <button class="pic-btn pic-btn-later" id="picLater">닫기</button>`;
+    }
+
+    card.innerHTML = `
+        <div class="pic-header">
+            <span class="pic-icon">📊</span>
+            <div class="pic-titles">
+                <strong class="pic-title">앱처럼 빠르게 사용하세요</strong>
+                <span class="pic-desc">홈 화면에 추가하면 앱처럼 한 번에 열립니다</span>
+            </div>
+            <button class="pic-close" id="picClose" aria-label="닫기">✕</button>
+        </div>
+        <div class="pic-actions">${actionHTML}</div>`;
+    document.body.appendChild(card);
+    requestAnimationFrame(() => card.classList.add('visible'));
+
+    const close = () => {
+        card.classList.remove('visible');
+        setTimeout(() => card.remove(), 250);
+    };
+    document.getElementById('picClose')?.addEventListener('click', close);
+    document.getElementById('picLater')?.addEventListener('click', close);
+    document.getElementById('picInstall')?.addEventListener('click', async () => {
+        const dp = window._deferredInstallPrompt;
+        if (!dp) { close(); return; }
+        try {
+            dp.prompt();
+            const { outcome } = await dp.userChoice;
+            if (outcome === 'accepted') {
+                showToast('✅ 설치되었습니다. 홈 화면에서 실행해 주세요!');
+            }
+        } catch (_) {}
+        window._deferredInstallPrompt = null;
+        close();
+    });
+
+    /* 30초 후 자동 닫기 (설치 결정 안 한 경우 화면 점유 방지) */
+    setTimeout(() => {
+        if (document.getElementById('pwaInstallCard')) close();
+    }, 30000);
+}
+
+/* ════════════════════════════════════════════
+   공유 수신자 CSV 업데이트 폴링
+   ────────────────────────────────────────────
+   - SW가 등록되지 않은 수신자도 CSV 갱신을 인지할 수 있게 함
+   - 5분마다 HEAD 요청으로 Last-Modified / ETag 비교
+   - 변경 감지 시 showCsvUpdateBanner() 호출 → 사용자가 새로고침 여부 결정
+   - 페이지가 background / hidden 일 때는 폴링 일시 중단 (배터리 절약)
+   - 같은 만료 토큰을 가진 모든 수신자가 동일하게 갱신 인지
+════════════════════════════════════════════ */
+function setupCsvPollingForRecipient() {
+    const POLL_INTERVAL = 5 * 60 * 1000; /* 5분 */
+    let lastSig = null;
+    let timer   = null;
+    let aborted = false;
+
+    /* CSV의 변경 감지 시그니처 — Last-Modified 우선, 없으면 ETag, 없으면 size */
+    const fetchSig = async () => {
+        try {
+            /* HEAD가 막힌 호스팅이면 GET 폴백 (헤더만 읽고 body는 무시) */
+            let res;
+            try {
+                res = await fetch('excel/map.csv', {
+                    method: 'HEAD',
+                    cache:  'no-store',
+                    headers:{ 'Pragma':'no-cache','Cache-Control':'no-cache, no-store' },
+                });
+                if (!res.ok) throw new Error('HEAD failed');
+            } catch (_) {
+                res = await fetch('excel/map.csv', {
+                    method: 'GET',
+                    cache:  'no-store',
+                    headers:{ 'Pragma':'no-cache','Cache-Control':'no-cache, no-store','Range':'bytes=0-0' },
+                });
+            }
+            const lm = res.headers.get('last-modified') || '';
+            const et = res.headers.get('etag')          || '';
+            const cl = res.headers.get('content-length')|| '';
+            return lm || et || cl || null;
+        } catch (_) { return null; }
+    };
+
+    const tick = async () => {
+        if (aborted) return;
+        if (document.hidden) return; /* 백그라운드 시 SKIP — 배터리 절약 */
+        const sig = await fetchSig();
+        if (!sig) return;
+        if (lastSig === null) {
+            lastSig = sig; /* 최초 측정값 기록 */
+            return;
+        }
+        if (sig !== lastSig) {
+            lastSig = sig;
+            /* 사용자가 직접 새로고침할 수 있는 배너 표시 (공유 수신자도 동일 UI) */
+            showCsvUpdateBanner();
+        }
+    };
+
+    /* 첫 호출은 1초 뒤 (페이지 안정화 대기) — 첫 측정은 시그니처 기준점 설정 */
+    setTimeout(tick, 1000);
+    timer = setInterval(tick, POLL_INTERVAL);
+
+    /* 가시성 복귀 시 즉시 한 번 체크 → 사용자가 탭으로 돌아올 때 빠른 인지 */
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) tick();
+    });
+
+    /* 페이지 unload 시 타이머 정리 */
+    window.addEventListener('beforeunload', () => {
+        aborted = true;
+        if (timer) clearInterval(timer);
+    });
 }
