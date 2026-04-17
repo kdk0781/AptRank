@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════
-   아파트 시세표 | app_src.js  v10.0  (2026-04-15)
+   아파트 시세표 | app_src.js  v11.0  (2026-04-16)
    ────────────────────────────────────────────
    ✅ 상태기계 CSV 파서 (O(n), 재앙적 정규식 제거)
    ✅ 동기 파싱 38ms — async 청크 구조 완전 제거
@@ -9,19 +9,23 @@
    ✅ 지난주 대비 가격 변동 표시 (curr/prev 두 슬롯)
    ✅ 일반가 기준 대출 가능 한도 표시
    ✅ CSV fetch cache: no-store (캐시 우회)
+   ✅ 관리자 모드 게이트 — 검색창 "관리자" 입력으로 활성화
+   ✅ PWA 설치 권한 토글 — 공유 토큰에 allowPwa 포함
+   ✅ 공유 수신자 CSV 업데이트 폴링 — SW 없는 수신자도 갱신 인지
+   ✅ 관리자 배지 sticky-header 최상단 인라인 바
    ──────────────────────────────────
-   🆕 v10 변경사항 (2026-04-15)
-   🆕 관리자 모드 게이트 — 검색창 "관리자" 입력으로 활성화
-      비관리자는 공유 버튼 클릭 시 현재 URL만 복사 (모달 노출 안 됨)
-      → 삼성 인터넷에서 모달 노출 버그 근본 해결
-   🆕 PWA 설치 권한 토글 — 공유 토큰에 allowPwa 포함
-      허용 시 수신자가 홈화면 설치 가능 + 최초 접속 시 설치 안내 카드
-   🆕 공유 수신자 CSV 업데이트 폴링 — SW 없는 수신자도 갱신 인지
-   🆕 PWA 설치자 Periodic Sync — 백그라운드 CSV 변경 감지 시 푸시
-   🆕 관리자 ‘배지/지속 표시’ + 검색창 "관리자해제"로 비활성화
+   🆕 v11 변경사항 (2026-04-16)
+   🆕 부관리자(Deputy) 모드 — 관리자 모달에 토글 추가
+      ON 시 수신자에게 풀 모달 권한 부여 (기간 최대 90일)
+      부관리자 재공유 링크의 수신자 → 기존 수신자 동작 (복사만)
+      부관리자 본인은 사용 기간 무제한 (영구 접속)
+   🆕 PWA 설치 즉시 파기 — 부관리자 링크에서 홈 화면 설치 완료 시
+      해당 공유 세션 즉시 만료 (appinstalled 이벤트 감지)
+   🆕 URL 단축 제거 — 직접 암호화 링크 사용 (외부 서비스 의존성 제거)
+   🆕 부관리자 모달 UX — 분/시간 단위 제거(일만), 90일 초과 생성 차단
 ════════════════════════════════════════════ */
 
-const APP_VERSION = 'v10.0';
+const APP_VERSION = 'v11.0';
 
 /* ════════════════════════════════════════════
    관리자 모드 설정
@@ -32,14 +36,19 @@ const APP_VERSION = 'v10.0';
    ADMIN_SECRET            : 무결성 서명용 (단순 변조 방지)
 
    동작:
-   - 관리자 모드 ON  → 공유 버튼 클릭 시 풀 모달 (기간/즐겨찾기/PWA 토글)
+   - 관리자 모드 ON  → 공유 버튼 클릭 시 풀 모달 (기간/즐겨찾기/PWA/부관리자 토글)
    - 관리자 모드 OFF → 공유 버튼 클릭 시 현재 URL만 클립보드 복사
-   - 공유 수신자(?k=토큰)는 위 둘과 무관하게 항상 받은 링크 복사
+   - 공유 수신자(?k=토큰)는 위 둘과 무관하게 다음 두 동작 중 하나:
+       ▸ 부관리자 권한 토큰 → 풀 모달 (기간 최대 90일, 원본 만료 이내)
+       ▸ 일반 수신자 토큰   → 받은 링크 그대로 복사
 ════════════════════════════════════════════ */
 const ADMIN_PASSPHRASE     = '관리자';
 const ADMIN_PASSPHRASE_OFF = '관리자해제';
 const ADMIN_LS_KEY         = '_apt_admin_v1';
 const ADMIN_SECRET         = 'kdk_apt_admin_2026';
+
+/* 부관리자가 재공유 시 적용할 기간 상한 (밀리초) */
+const DEPUTY_MAX_MS = 90 * 24 * 60 * 60 * 1000; /* 90일 */
 
 /* 단순 무결성 서명 — 사용자가 localStorage 값을 임의로 추측해 위조하기 어렵게 함
    진짜 보안 목적은 아니며, 우발적 켜짐 방지용 */
@@ -251,7 +260,9 @@ function checkShareLink() {
     let decoded = null;
     try {
         decoded = shareDecrypt(token);
-        isValid = Date.now() < decoded.exp;
+        /* 부관리자(deputy=true) 토큰은 만료 무시 — 본인은 영구 사용 가능
+           부관리자가 재발급한 하위 링크만 기간 제한 적용 */
+        isValid = !!decoded.deputy || Date.now() < decoded.exp;
     } catch (_) {}
 
     if (isValid) {
@@ -272,7 +283,9 @@ function checkShareLink() {
         /* PWA 설치 권한: 토큰의 allowPwa 플래그 (관리자가 생성 시 결정)
            true  → 수신자가 홈화면 설치 가능 + 최초 접속 시 안내 카드 표시
            false → 기존 동작 (manifest/apple 메타 제거 + 설치 프롬프트 차단) */
-        const allowPwa = !!decoded.allowPwa;
+        const allowPwa         = !!decoded.allowPwa;
+        const isDeputy         = !!decoded.deputy;           /* 부관리자 권한 부여된 링크 */
+        const destroyOnInstall = !!decoded.destroyOnInstall; /* PWA 설치 시 즉시 파기 */
 
         if (!allowPwa) {
             window.addEventListener('beforeinstallprompt', e => {
@@ -288,11 +301,39 @@ function checkShareLink() {
             });
         }
 
+        /* PWA 설치 완료 시 즉시 파기 (부관리자 링크에서 destroyOnInstall=true인 경우)
+           appinstalled 이벤트는 사용자가 "홈 화면에 추가"를 최종 수락했을 때 발생.
+           이 순간 해당 공유 세션을 즉시 만료 처리.
+           standalone 창과 탭이 별도로 뜨므로, 탭의 만료 확정 플래그만 세우면
+           다음 접속부터 자동 차단됨 (PWA에서 새로 열 때도 동일 만료 페이지) */
+        if (destroyOnInstall) {
+            window.addEventListener('appinstalled', () => {
+                try {
+                    sessionStorage.removeItem('_shr_t');
+                    sessionStorage.removeItem('_shr_u');
+                    sessionStorage.setItem('_shr_blocked', '1');
+                    localStorage.removeItem('_shr_ls');
+                    localStorage.setItem('_shr_exp', '1'); /* 만료 확정 플래그 */
+                } catch (_) {}
+                /* SW 해제: 설치된 PWA가 향후 CSV를 계속 받는 것을 차단
+                   (부관리자 링크의 목적은 임시 열람이므로 영구 설치 방지) */
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.getRegistrations()
+                        .then(regs => regs.forEach(r => r.unregister()))
+                        .catch(() => {});
+                }
+                /* 현재 탭도 만료 페이지로 전환 */
+                showExpiredAndBlock();
+            });
+        }
+
         window._shareOrigUrl      = origUrl;
         window._isShareRecipient  = true;
         window._shareIncludeFavs  = !!decoded.includeFavs;
         window._shareAllowPwa     = allowPwa;
         window._shareExp          = decoded.exp;
+        window._isDeputy          = isDeputy;
+        window._destroyOnInstall  = destroyOnInstall;
         return true;
     }
 
@@ -1552,16 +1593,22 @@ function setupScrollTopBtn() {
 /* ════════════════════════════════════════════
    임시 공유 링크 생성 & 모달
    ────────────────────────────────────────────
-   ▶ 공유 수신자 (URL에 ?k= 토큰 보유)
-      공유 버튼 → 받은 링크 그대로 복사 (모달 없음)
-      → 두 사람 모두 동일 만료 시점에 접근 차단
+   네 가지 상태를 명시적으로 구분해서 모달 노출을 엄격히 제어.
 
-   ▶ 관리자 (검색창 "관리자" 입력으로 활성화)
-      공유 버튼 → 풀 모달 (기간 / 즐겨찾기 토글 / PWA 설치 토글)
+   ① 부관리자 수신자  (토큰에 deputy=true)
+      공유 버튼 → 풀 모달, 단 기간 최대 90일 + 원본 만료 초과 불가
+      부관리자가 생성한 링크의 수신자는 → 기존 "일반 수신자" 동작
+      (부관리자 체인이 끊김: 재-재공유는 복사만)
 
-   ▶ 일반 오너 (관리자 아님 + 토큰 없음)
-      공유 버튼 → 현재 페이지 URL 복사만 수행 (모달 노출 X)
-      → 삼성 인터넷 등에서 모달 노출되던 문제 해결
+   ② 일반 수신자       (토큰 있음 + deputy=false)
+      공유 버튼 → 받은 링크 그대로 복사
+
+   ③ 관리자            (검색창 "관리자" 입력 + 토큰 없음)
+      공유 버튼 → 풀 모달 (기간/즐겨찾기/PWA/부관리자 토글)
+
+   ④ 비관리자 방문자   (토큰 없음 + 관리자 아님)
+      공유 버튼 → 현재 페이지 URL만 복사, 모달 노출 안 됨
+      → 삼성 인터넷 등 일반 방문자에게 모달 노출되던 문제 원천 차단
 
    ▶ 만료 문구: app_src.js 상단 SHARE_EXPIRED_MSG 수정
 ════════════════════════════════════════════ */
@@ -1608,8 +1655,18 @@ function setupShareBtn() {
         }, 1800);
     };
 
-    /* ════ ① 공유 수신자 모드 ════
-       받은 링크를 그대로 복사. 관리자/일반 구분과 무관 */
+    /* ════ ① 부관리자 수신자 ════
+       풀 모달을 쓰되, 기간 최대 90일(일 단위만), 부관리자 토글 숨김 */
+    if (window._isShareRecipient && window._isDeputy) {
+        bindDeputyModal({
+            openBtn, modal, closeBtn, genBtn, copyBtn, linkInput, resultBox, copyMsg,
+            safeCopy,
+        });
+        return;
+    }
+
+    /* ════ ② 일반 수신자 ════
+       받은 링크 그대로 복사 */
     if (window._isShareRecipient) {
         openBtn.addEventListener('click', async () => {
             const url = window._shareOrigUrl || location.href;
@@ -1619,12 +1676,10 @@ function setupShareBtn() {
         return;
     }
 
-    /* ════ ② 비관리자 모드 (URL 토큰도 없고 관리자도 아닌 일반 방문자) ════
-       모달을 절대 노출하지 않고 현재 페이지 URL만 복사
-       → 삼성 인터넷·기타 브라우저에서 모달 노출되던 문제 근본 차단 */
+    /* ════ ④ 비관리자 방문자 ════
+       모달 노출 금지, 현재 페이지 URL 복사 */
     if (!isAdmin()) {
         openBtn.addEventListener('click', async () => {
-            /* 현재 location의 ?k 등 잔여 파라미터 제거 후 깔끔한 URL */
             const u = new URL(location.href);
             u.search = ''; u.hash = '';
             u.pathname = u.pathname.replace(/\/index\.html$/, '/');
@@ -1636,71 +1691,79 @@ function setupShareBtn() {
 
     /* ════ ③ 관리자 모드 ════ */
 
-    /* 모달 열기 */
+    /* 관리자 모달: 부관리자 토글 표시, Deputy 전용 힌트 숨김 */
+    document.getElementById('shareDeputyWrap')?.style.setProperty('display', 'flex');
+    document.getElementById('shareDeputyHint')?.style.setProperty('display', 'none');
+
     openBtn.addEventListener('click', () => {
         modal.classList.add('open');
         resultBox.style.display = 'none';
         copyMsg.style.display   = 'none';
     });
 
-    /* 모달 닫기 */
     closeBtn.addEventListener('click', () => modal.classList.remove('open'));
     modal.addEventListener('click', e => {
         if (e.target === modal) modal.classList.remove('open');
     });
 
-    /* 링크 생성 */
-    genBtn.addEventListener('click', async () => {
-        const dur  = Math.max(1, parseInt(document.getElementById('shareDuration').value) || 1);
-        const unit = parseInt(document.getElementById('shareUnit').value);
-        const exp  = Date.now() + dur * unit;
+    /* 링크 생성 (관리자)
+       ─────────────────────────────────────────
+       부관리자 토글 ON  → 1~3번 유효성 검사 스킵, exp 100년(영구 사용)
+       부관리자 토글 OFF → 1~3번 유효성 검사 실행, 설정 기간대로 exp 적용
+       URL 단축 없음 → 직접 암호화 링크 사용 (안정성 최우선)
+       ───────────────────────────────────────── */
+    genBtn.addEventListener('click', () => {
+        const _deputy   = document.getElementById('shareDeputyToggle')?.checked || false;
+        const _inclFav  = document.getElementById('shareFavToggle')?.checked    || false;
+        const _allowPwa = document.getElementById('sharePwaToggle')?.checked    || false;
 
-        /* 즐겨찾기 기능 허용 여부 (오너 데이터 X, 수신자 기능 활성화 여부만) */
-        const _inclFav  = document.getElementById('shareFavToggle')?.checked || false;
-        /* PWA 설치 허용 여부 */
-        const _allowPwa = document.getElementById('sharePwaToggle')?.checked || false;
+        let exp;
 
-        /* XOR 암호화 토큰 생성 (exp + includeFavs + allowPwa) */
-        const token = shareEncrypt({ exp, includeFavs: _inclFav, allowPwa: _allowPwa });
+        if (_deputy) {
+            /* 부관리자 ON → 1~3번 유효성 검사 불필요
+               부관리자 본인은 영구 사용 (100년) */
+            exp = Date.now() + 365 * 100 * 24 * 60 * 60 * 1000;
+        } else {
+            /* 일반 공유 → 기간 유효성 검사 */
+            const dur  = Math.max(1, parseInt(document.getElementById('shareDuration').value) || 1);
+            const unit = parseInt(document.getElementById('shareUnit').value);
+            exp = Date.now() + dur * unit;
+        }
+
+        const tokenPayload = {
+            exp,
+            includeFavs:      _deputy ? true : _inclFav,   /* 부관리자는 모든 기능 기본 활성 */
+            allowPwa:          _deputy ? true : _allowPwa,
+            deputy:            _deputy,
+            destroyOnInstall:  _deputy,                     /* 부관리자 링크: PWA 설치 시 즉시 파기 */
+        };
+        const token = shareEncrypt(tokenPayload);
 
         const baseUrl = new URL(location.href);
         baseUrl.pathname = baseUrl.pathname.replace(/\/index\.html$/, '/');
         baseUrl.search = '?' + SHARE_PARAM + '=' + token;
         baseUrl.hash   = '';
-        const longUrl  = baseUrl.toString();
+        const finalUrl = baseUrl.toString();
 
-        /* UI 초기 상태 */
+        /* UI 표시 */
         resultBox.style.display = 'flex';
         copyMsg.style.display   = 'none';
-        linkInput.value         = '링크 생성 중...';
-        copyBtn.disabled        = true;
 
-        const d = new Date(exp);
-        document.getElementById('shareExpLabel').textContent =
-            '만료: ' + d.toLocaleDateString('ko-KR') + ' ' +
-            d.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit' })
-            + (_allowPwa ? '  ·  📲 PWA 설치 허용' : '')
-            + (_inclFav  ? '  ·  ⭐ 즐겨찾기 허용'  : '');
+        if (_deputy) {
+            document.getElementById('shareExpLabel').textContent =
+                '👤 부관리자 링크  ·  사용 기간 제한 없음  ·  📲 PWA/⭐ 즐겨찾기 기본 허용';
+        } else {
+            const d = new Date(exp);
+            const expStr = '만료: ' + d.toLocaleDateString('ko-KR') + ' ' +
+                d.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit' });
+            const flags = [
+                _allowPwa ? '📲 PWA 설치 허용'  : null,
+                _inclFav  ? '⭐ 즐겨찾기 허용'   : null,
+            ].filter(Boolean).join('  ·  ');
+            document.getElementById('shareExpLabel').textContent =
+                flags ? expStr + '  ·  ' + flags : expStr;
+        }
 
-        /* URL 단축: is.gd → 실패 시 tinyurl 폴백 → 둘 다 실패 시 원본 */
-        let finalUrl = longUrl;
-        const shortenWith = async (api) => {
-            try {
-                const ctrl = new AbortController();
-                const tid = setTimeout(() => ctrl.abort(), 4000);
-                const res = await fetch(api, { signal: ctrl.signal });
-                clearTimeout(tid);
-                const txt = (await res.text()).trim();
-                if (/^https?:\/\//.test(txt)) return txt;
-            } catch (_) {}
-            return null;
-        };
-        const short =
-            await shortenWith('https://is.gd/create.php?format=simple&url=' + encodeURIComponent(longUrl)) ||
-            await shortenWith('https://tinyurl.com/api-create.php?url=' + encodeURIComponent(longUrl));
-        if (short) finalUrl = short;
-
-        /* 공유 메시지 + URL 분리 저장 */
         linkInput.value  = SHARE_COPY_TEMPLATE(finalUrl);
         copyBtn.disabled = false;
         const urlOnlyBtn = document.getElementById('shareUrlOnlyBtn');
@@ -1722,6 +1785,139 @@ function setupShareBtn() {
     document.getElementById('shareUrlOnlyBtn')?.addEventListener('click', async () => {
         const urlBtn = document.getElementById('shareUrlOnlyBtn');
         const url = urlBtn?.dataset.url || window._shareOrigUrl || '';
+        if (!url) return;
+        const ok = await safeCopy(url);
+        const orig = urlBtn.textContent;
+        urlBtn.textContent = ok ? '✅ 복사됨!' : '❌ 복사 실패';
+        setTimeout(() => { urlBtn.textContent = orig; }, 2000);
+    });
+}
+
+/* ════════════════════════════════════════════
+   부관리자(Deputy) 모달 바인딩
+   ────────────────────────────────────────────
+   관리자가 발급한 deputy=true 토큰을 가진 수신자 전용.
+   풀 모달을 쓰되 다음 제약 적용:
+
+     ① 부관리자 토글: display:none (부관리자는 다른 부관리자를 만들 수 없음)
+     ② Deputy 힌트 박스: display:none (불필요한 안내 숨김)
+     ③ 단위: '일(기본)' 만 사용 (분/시간 제거)
+     ④ 기간: 최대 90일 — 초과 시 전문적 안내 문구 + 생성 차단
+     ⑤ 즐겨찾기·PWA 토글: 자유 설정 가능 (유효성 검사 없음)
+     ⑥ URL 단축 없음: 직접 암호화 링크 사용
+
+   발행되는 새 토큰: deputy=false → 수신자는 '일반 수신자' 동작 (복사만)
+════════════════════════════════════════════ */
+function bindDeputyModal(ctx) {
+    const { openBtn, modal, closeBtn, genBtn, copyBtn, linkInput, resultBox, copyMsg,
+            safeCopy } = ctx;
+
+    /* ── UI 초기화: 부관리자 토글/힌트 숨김 ── */
+    const deputyWrap = document.getElementById('shareDeputyWrap');
+    const deputyHint = document.getElementById('shareDeputyHint');
+    if (deputyWrap) deputyWrap.style.display = 'none';
+    if (deputyHint) deputyHint.style.display = 'none';
+
+    /* ── 단위 선택: 일(day)만 남기고 분/시간 제거 ── */
+    const unitSel  = document.getElementById('shareUnit');
+    const durInput = document.getElementById('shareDuration');
+    if (unitSel) {
+        /* 기존 옵션 중 '일' 이외 제거 */
+        const opts = unitSel.querySelectorAll('option');
+        opts.forEach(o => {
+            if (o.value !== '86400000') o.remove();
+        });
+        unitSel.value = '86400000';
+    }
+    /* 기간 입력 max 90일 */
+    if (durInput) {
+        durInput.max = '90';
+        if (parseInt(durInput.value) > 90) durInput.value = '90';
+    }
+
+    /* 모달 제목 변경 (부관리자용) */
+    const titleEl = modal?.querySelector('.share-modal-title');
+    if (titleEl) {
+        titleEl.innerHTML = titleEl.innerHTML.replace('임시 공유 링크 생성', '공유 링크 생성');
+    }
+
+    /* 모달 열기 */
+    openBtn.addEventListener('click', () => {
+        modal.classList.add('open');
+        resultBox.style.display = 'none';
+        copyMsg.style.display   = 'none';
+    });
+
+    closeBtn.addEventListener('click', () => modal.classList.remove('open'));
+    modal.addEventListener('click', e => {
+        if (e.target === modal) modal.classList.remove('open');
+    });
+
+    /* 링크 생성 (부관리자 — 90일 상한 제한) */
+    genBtn.addEventListener('click', () => {
+        const dur = Math.max(1, parseInt(durInput?.value) || 1);
+
+        /* ── 90일 초과 차단 (전문 안내 문구) ── */
+        if (dur > 90) {
+            durInput.value = '90';
+            showToast('⚠️ 데이터 보관 정책에 따라 공유 기간은 최대 90일까지 설정할 수 있습니다.');
+            return; /* 링크 생성하지 않음 */
+        }
+
+        const exp = Date.now() + dur * 86400000; /* 일 단위 고정 */
+
+        const _inclFav  = document.getElementById('shareFavToggle')?.checked || false;
+        const _allowPwa = document.getElementById('sharePwaToggle')?.checked || false;
+
+        /* 부관리자가 발급: deputy=false, destroyOnInstall=false
+           → 수신자는 '일반 수신자' 동작 (복사만, 체인 차단) */
+        const token = shareEncrypt({
+            exp,
+            includeFavs:      _inclFav,
+            allowPwa:         _allowPwa,
+            deputy:           false,
+            destroyOnInstall: false,
+        });
+
+        const baseUrl = new URL(location.href);
+        baseUrl.pathname = baseUrl.pathname.replace(/\/index\.html$/, '/');
+        baseUrl.search = '?' + SHARE_PARAM + '=' + token;
+        baseUrl.hash   = '';
+        const finalUrl = baseUrl.toString();
+
+        resultBox.style.display = 'flex';
+        copyMsg.style.display   = 'none';
+
+        const d = new Date(exp);
+        const expStr = '만료: ' + d.toLocaleDateString('ko-KR') + ' ' +
+            d.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit' });
+        const flags = [
+            _allowPwa ? '📲 PWA 설치 허용' : null,
+            _inclFav  ? '⭐ 즐겨찾기 허용'  : null,
+        ].filter(Boolean).join('  ·  ');
+        document.getElementById('shareExpLabel').textContent =
+            (flags ? expStr + '  ·  ' + flags : expStr) + '  ·  👤 부관리자 발행';
+
+        linkInput.value  = SHARE_COPY_TEMPLATE(finalUrl);
+        copyBtn.disabled = false;
+        const urlOnlyBtn = document.getElementById('shareUrlOnlyBtn');
+        if (urlOnlyBtn) urlOnlyBtn.dataset.url = finalUrl;
+    });
+
+    /* 메시지 전체 복사 */
+    copyBtn.addEventListener('click', async () => {
+        const ok = await safeCopy(linkInput.value);
+        copyMsg.textContent = ok
+            ? '✅ 클립보드에 복사됐습니다. 카카오톡 · 문자에 붙여넣기 하세요!'
+            : '❌ 복사 실패. 텍스트를 길게 눌러 직접 복사해 주세요.';
+        copyMsg.style.display = 'block';
+        setTimeout(() => { copyMsg.style.display = 'none'; }, 2500);
+    });
+
+    /* URL만 복사 */
+    document.getElementById('shareUrlOnlyBtn')?.addEventListener('click', async () => {
+        const urlBtn = document.getElementById('shareUrlOnlyBtn');
+        const url = urlBtn?.dataset.url || '';
         if (!url) return;
         const ok = await safeCopy(url);
         const orig = urlBtn.textContent;
