@@ -1,21 +1,20 @@
 /* ════════════════════════════════════════════
-   서비스워커 — apt-price-v11  (2026-04-15)
+   서비스워커 — apt-price-v12  (2026-04-17)
    ────────────────────────────────────────────
-   변경:
-   - 캐시 ID v10 → v11 (강제 갱신)
-   - 중복 push / notificationclick 핸들러 제거 (단일 진입점)
-   - Periodic Background Sync 'csv-check' 추가 — PWA 백그라운드 갱신 감지
-   - 포그라운드 클라이언트 존재 시 알림 SKIP (인앱 배너로 충분)
-   - HEAD 실패 환경 대비 fetch 오류 응답 정상 반환 (앱 멈춤 방지)
+   변경 (v12):
+   - 캐시 v11 → v12 (강제 갱신)
+   - sendPushNotification: 포그라운드 판단 로직 강화
+   - Periodic Sync: 인터벌 6시간으로 단축 (CSV 갱신 감지 빈도 향상)
+   - notificationclick: 앱 열 때 자동 새로고침 트리거
    ────────────────────────────────────────────
    전략:
    ① HTML/CSS/JS → Cache-First
    ② map.csv     → Network-Only (no-store) + 변경 감지
    ③ 외부 도메인 → 무시
-   ④ CSV 변경 감지 → 앱에 postMessage + (백그라운드일 때) 푸시 알림
-   ⑤ Periodic Sync 'csv-check' → 12시간마다 백그라운드 비교
+   ④ CSV 변경 감지 → 앱에 postMessage + (백그라운드일 때) 앱 알림
+   ⑤ Periodic Sync 'csv-check' → 6시간마다 백그라운드 비교
 ════════════════════════════════════════════ */
-const CACHE = 'apt-price-v11';
+const CACHE = 'apt-price-v12';
 const STATIC = [
     './',
     './index.html',
@@ -74,9 +73,10 @@ self.addEventListener('fetch', e => {
     );
 });
 
-/* ── Periodic Background Sync (PWA 설치자, 12시간 간격) ──
+/* ── Periodic Background Sync (PWA 설치자, 6시간 간격) ──
    브라우저가 적절한 시점(보통 와이파이 + 충전중)에 호출.
-   여기서 CSV를 GET → handleCsvFetch가 변경 감지를 수행. */
+   여기서 CSV를 GET → handleCsvFetch가 변경 감지를 수행.
+   알림 권한이 granted 상태면 변경 시 앱 알림 자동 표시. */
 self.addEventListener('periodicsync', e => {
     if (e.tag === 'csv-check') {
         e.waitUntil(handleCsvFetch(new Request(CSV_URL, { cache: 'no-store' })));
@@ -128,9 +128,11 @@ function notifyClients(type, data) {
     });
 }
 
-/* ── 푸시 알림 표시 ──
+/* ── 앱 알림 표시 ──
    포그라운드 클라이언트가 있으면 알림 SKIP (인앱 배너로 충분 → 중복 방지)
-   백그라운드일 때만 실제 알림 발송. tag 동일 → 중복 알림 자동 대체 */
+   백그라운드일 때만 실제 알림 발송. tag 동일 → 중복 알림 자동 대체
+   ※ 이 알림은 self.registration.showNotification()을 사용하므로
+     외부 Push 서버 없이도 동작합니다 (Notification.permission만 필요) */
 async function sendPushNotification() {
     try {
         const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
@@ -138,9 +140,13 @@ async function sendPushNotification() {
         if (visible) return;
     } catch (_) {}
 
+    /* 알림 본문에 현재 시각 포함 → 사용자가 '언제 업데이트됐나' 인지 가능 */
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+
     try {
         await self.registration.showNotification('📊 아파트 시세 업데이트', {
-            body:  '최신 KB 아파트 시세가 업데이트되었습니다.',
+            body:  `최신 KB 아파트 시세가 업데이트되었습니다. (${timeStr})`,
             icon:  './icons/icon-192.png',
             badge: './icons/icon-96.png',
             tag:   NOTIF_TAG_UPDATE,

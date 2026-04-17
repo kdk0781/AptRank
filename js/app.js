@@ -561,9 +561,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if ('serviceWorker' in navigator && _shouldRegSW) {
         navigator.serviceWorker.register('sw.js').then(async (reg) => {
-            /* 알림 권한 요청 — 오너만 (수신자에겐 자동 요청 안 함) */
+            /* 알림 권한 요청 — 오너만 (수신자에겐 PWA 설치 카드에서 처리) */
             if (!_isShared) {
-                setTimeout(() => requestNotificationPermission(), 3000);
+                setTimeout(() => {
+                    /* PWA 설치 상태면 setupLocalNotification()이 배너로 처리하므로
+                       여기서는 비-PWA 오너만 직접 요청 (브라우저 탭 사용자) */
+                    if (!isPWAInstalled()) {
+                        requestNotificationPermission();
+                    }
+                }, 3000);
             }
 
             /* SW로부터 CSV 업데이트 메시지 수신 (오너 + PWA 허용 수신자 모두) */
@@ -573,14 +579,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
 
-            /* Periodic Background Sync — 지원 브라우저에서 12시간마다 CSV 변경 확인
-               PWA 설치자에게 백그라운드 푸시 효과 제공 */
+            /* Periodic Background Sync — 지원 브라우저에서 6시간마다 CSV 변경 확인
+               PWA 설치자에게 백그라운드 알림 효과 제공 */
             try {
                 if ('periodicSync' in reg) {
                     const status = await navigator.permissions.query({ name: 'periodic-background-sync' });
                     if (status.state === 'granted') {
                         await reg.periodicSync.register('csv-check', {
-                            minInterval: 12 * 60 * 60 * 1000, /* 12시간 */
+                            minInterval: 6 * 60 * 60 * 1000, /* 6시간 */
                         });
                         console.log('[PeriodicSync] csv-check 등록');
                     }
@@ -919,9 +925,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
     loadData();
 
-    /* PWA 설치자 Web Push 구독 초기화 */
+    /* PWA 설치자 알림 초기화
+       ─────────────────────────────────────────
+       ① 로컬 알림: SW의 showNotification()만 사용 (서버 불필요)
+          → PUSH_WORKER_URL 없어도 CSV 변경 감지 시 앱 알림 표시
+          → Notification.permission === 'granted' 만 확보하면 됨
+       ② 외부 푸시: PUSH_WORKER_URL 설정 시 추가 기능 (선택)
+       
+       오너 + PWA 허용 수신자 모두 동일하게 적용 */
     if (isPWAInstalled()) {
-        setupPushNotification();
+        setupLocalNotification();   /* 로컬 알림 (서버 불필요) */
+        setupPushNotification();    /* 외부 푸시 (PUSH_WORKER_URL 설정 시) */
     }
 });
 
@@ -2303,6 +2317,84 @@ function isPWAInstalled() {
         || window.navigator.standalone === true;
 }
 
+/* ════════════════════════════════════════════
+   로컬 알림 초기화 (PUSH_WORKER_URL 불필요)
+   ────────────────────────────────────────────
+   SW의 sendPushNotification()은 self.registration.showNotification()을
+   사용하므로 외부 서버 없이 Notification.permission === 'granted' 만
+   확보하면 CSV 변경 시 자동으로 알림이 표시됩니다.
+
+   이 함수는 PWA 설치자(오너 + 수신자 모두)에서 호출됩니다.
+   ① 이미 허용됨 → 아무것도 안 함 (SW가 알아서 처리)
+   ② 이미 거부됨 → 아무것도 안 함 (재요청 불가)
+   ③ 미결정(default) → 알림 배너 표시 (7일 간격)
+════════════════════════════════════════════ */
+function setupLocalNotification() {
+    if (!('Notification' in window) || !('serviceWorker' in navigator)) return;
+    if (Notification.permission === 'granted') return;  /* 이미 허용 */
+    if (Notification.permission === 'denied')  return;  /* 이미 거부 */
+
+    /* 7일 내 거부한 적 있으면 재표시 안 함 */
+    try {
+        const denied = localStorage.getItem('_notif_denied');
+        if (denied && Date.now() - parseInt(denied) < 7 * 86400000) return;
+    } catch (_) {}
+
+    /* 약간의 딜레이 후 배너 표시 (페이지 안정화 대기) */
+    setTimeout(showNotifBanner, 2000);
+}
+
+/* 알림 허용 배너 (로컬 알림 전용) */
+function showNotifBanner() {
+    if (document.getElementById('notifBanner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'notifBanner';
+    banner.className = 'push-banner';
+    banner.innerHTML = `
+        <div class="pb-content">
+            <span class="pb-icon">🔔</span>
+            <div class="pb-text">
+                <strong>시세 업데이트 알림</strong>
+                <span>새 CSV 데이터 등록 시 앱 알림을 받아보세요</span>
+            </div>
+        </div>
+        <div class="pb-actions">
+            <button class="pb-allow" id="notifAllow">허용</button>
+            <button class="pb-deny"  id="notifDeny">닫기</button>
+        </div>`;
+    document.body.appendChild(banner);
+    setTimeout(() => banner.classList.add('visible'), 100);
+
+    document.getElementById('notifAllow').addEventListener('click', async () => {
+        banner.remove();
+        await requestLocalNotifPermission();
+    });
+    document.getElementById('notifDeny').addEventListener('click', () => {
+        banner.classList.remove('visible');
+        setTimeout(() => banner.remove(), 300);
+        try { localStorage.setItem('_notif_denied', String(Date.now())); } catch (_) {}
+    });
+}
+
+/* 로컬 알림 권한 요청 (서버 불필요 — SW가 showNotification으로 처리) */
+async function requestLocalNotifPermission() {
+    try {
+        const perm = await Notification.requestPermission();
+        if (perm === 'granted') {
+            showToast('🔔 알림이 설정되었습니다! CSV 업데이트 시 앱 알림이 전송됩니다.');
+        } else {
+            showToast('알림 권한이 거부되었습니다. 브라우저 설정에서 변경할 수 있습니다.');
+        }
+    } catch (_) {}
+}
+
+/* ════════════════════════════════════════════
+   기존 Web Push 시스템 (PUSH_WORKER_URL 필요)
+   ────────────────────────────────────────────
+   PUSH_WORKER_URL이 설정된 경우에만 작동.
+   미설정 시 위의 로컬 알림(setupLocalNotification)으로 대체됨.
+════════════════════════════════════════════ */
+
 /* 초기화: 이미 구독 완료면 스킵, 미구독이면 배너 표시 */
 async function setupPushNotification() {
     if (!PUSH_WORKER_URL) return; // Worker URL 미설정 시 스킵
@@ -2326,7 +2418,7 @@ async function setupPushNotification() {
     }
 }
 
-/* 알림 허용 배너 */
+/* 알림 허용 배너 (Web Push 전용) */
 function showPushBanner() {
     if (document.getElementById('pushBanner')) return;
     const banner = document.createElement('div');
@@ -2598,31 +2690,42 @@ function showPwaInstallPromptForRecipient() {
     const ua = navigator.userAgent;
     const isIOS    = /iPad|iPhone|iPod/.test(ua) && !window.MSStream;
     const isSafari = isIOS && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua);
-    /* 삼성 인터넷도 Chromium 기반이라 deferredPrompt 사용 가능 */
     const canPrompt = !!window._deferredInstallPrompt;
+    const canNotif  = 'Notification' in window && Notification.permission !== 'denied';
 
     const card = document.createElement('div');
     card.id = 'pwaInstallCard';
     card.className = 'pwa-install-card';
 
+    /* 알림 체크박스 (Notification API 지원 + 아직 거부 안 한 경우만) */
+    const notifCheckHTML = canNotif ? `
+        <label class="pic-notif-check">
+            <input type="checkbox" id="picNotifCheck" checked>
+            <span class="pic-notif-text">🔔 시세 업데이트 알림 받기</span>
+        </label>` : '';
+
     let actionHTML = '';
     if (canPrompt) {
         actionHTML = `
-            <button class="pic-btn pic-btn-install" id="picInstall">📲 홈 화면에 설치</button>
-            <button class="pic-btn pic-btn-later"   id="picLater">나중에</button>`;
+            ${notifCheckHTML}
+            <div class="pic-btn-row">
+                <button class="pic-btn pic-btn-install" id="picInstall">📲 홈 화면에 설치</button>
+                <button class="pic-btn pic-btn-later"   id="picLater">나중에</button>
+            </div>`;
     } else if (isIOS && isSafari) {
         actionHTML = `
             <p class="pic-ios-guide">
                 Safari 하단 <b>공유 버튼 <span class="pic-ios-icon">⬆︎</span></b> →
                 <b>"홈 화면에 추가"</b> 를 눌러주세요
             </p>
+            ${notifCheckHTML}
             <button class="pic-btn pic-btn-later" id="picLater">닫기</button>`;
     } else {
-        /* 비-iOS인데 deferredPrompt 없음 → 브라우저 메뉴 안내 */
         actionHTML = `
             <p class="pic-ios-guide">
                 브라우저 메뉴 → <b>"홈 화면에 추가"</b> 또는 <b>"앱 설치"</b> 를 선택해주세요
             </p>
+            ${notifCheckHTML}
             <button class="pic-btn pic-btn-later" id="picLater">닫기</button>`;
     }
 
@@ -2643,6 +2746,23 @@ function showPwaInstallPromptForRecipient() {
         card.classList.remove('visible');
         setTimeout(() => card.remove(), 250);
     };
+
+    /* 설치 후 알림 권한 요청 (체크 시에만) */
+    const afterInstall = async () => {
+        const wantNotif = document.getElementById('picNotifCheck')?.checked;
+        if (wantNotif && canNotif && Notification.permission === 'default') {
+            /* 약간의 딜레이: 설치 애니메이션이 끝난 뒤 자연스럽게 요청 */
+            setTimeout(async () => {
+                try {
+                    const perm = await Notification.requestPermission();
+                    if (perm === 'granted') {
+                        showToast('🔔 알림이 설정되었습니다! CSV 업데이트 시 알림이 전송됩니다.');
+                    }
+                } catch (_) {}
+            }, 800);
+        }
+    };
+
     document.getElementById('picClose')?.addEventListener('click', close);
     document.getElementById('picLater')?.addEventListener('click', close);
     document.getElementById('picInstall')?.addEventListener('click', async () => {
@@ -2653,13 +2773,24 @@ function showPwaInstallPromptForRecipient() {
             const { outcome } = await dp.userChoice;
             if (outcome === 'accepted') {
                 showToast('✅ 설치되었습니다. 홈 화면에서 실행해 주세요!');
+                await afterInstall();
             }
         } catch (_) {}
         window._deferredInstallPrompt = null;
         close();
     });
 
-    /* 30초 후 자동 닫기 (설치 결정 안 한 경우 화면 점유 방지) */
+    /* iOS/기타: "닫기"를 누르되 체크박스가 체크되어 있으면 알림 권한만 요청 */
+    document.getElementById('picLater')?.addEventListener('click', async () => {
+        const wantNotif = document.getElementById('picNotifCheck')?.checked;
+        if (wantNotif && canNotif && Notification.permission === 'default') {
+            setTimeout(async () => {
+                try { await Notification.requestPermission(); } catch (_) {}
+            }, 500);
+        }
+    });
+
+    /* 30초 후 자동 닫기 */
     setTimeout(() => {
         if (document.getElementById('pwaInstallCard')) close();
     }, 30000);
