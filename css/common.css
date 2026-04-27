@@ -1140,7 +1140,7 @@ body.pyeong-mode .u-sqm    { display: none !important; }
 
 /* 모바일에서 주요 지역 외 칩 숨김 */
 @media screen and (max-width: 768px) {
-    .region-chip.mobile-hidden { display: none; }
+    /* 전국 시도 칩: 가로 스크롤로 모두 노출 (mobile-hidden 제거됨) */
 }
 
 
