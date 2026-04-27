@@ -1273,21 +1273,49 @@ function buildRegionChips(regions) {
     const wrap = document.getElementById('regionFilter');
     if (!wrap) return;
 
-    /* 모바일 주요 지역 목록 (이 외는 mobile-hidden 클래스로 숨김) */
-    const MOBILE_MAIN = new Set(['전체','서울특별시','경기도','인천광역시']);
-
     /* 공유 수신자 + 즐겨찾기 미포함이면 칩 숨김 */
     const _showFavChip = !window._isShareRecipient || window._shareIncludeFavs;
+
+    /* 시도 표시 순서: 수도권 → 광역시 → 도 → 특별자치 (한눈에 익숙한 순서)
+       regions에 없는 시도는 자동 건너뜀 */
+    const REGION_ORDER = [
+        '전체',
+        '서울특별시','경기도','인천광역시',
+        '부산광역시','대구광역시','광주광역시','대전광역시','울산광역시',
+        '세종특별자치시',
+        '강원특별자치도',
+        '충청북도','충청남도',
+        '전북특별자치도','전라남도',
+        '경상북도','경상남도',
+        '제주특별자치도',
+    ];
+    const regionSet = new Set(regions);
+    const ordered = REGION_ORDER.filter(r => regionSet.has(r));
+    /* ORDER에 없는 새 시도가 나올 경우 뒤에 추가 */
+    regions.forEach(r => { if (!ordered.includes(r)) ordered.push(r); });
+
+    /* 시도명 축약 (칩 너비 절약) */
+    const SHORT = {
+        '서울특별시':'서울','경기도':'경기','인천광역시':'인천',
+        '부산광역시':'부산','대구광역시':'대구','광주광역시':'광주',
+        '대전광역시':'대전','울산광역시':'울산',
+        '세종특별자치시':'세종',
+        '강원특별자치도':'강원',
+        '충청북도':'충북','충청남도':'충남',
+        '전북특별자치도':'전북','전라남도':'전남',
+        '경상북도':'경북','경상남도':'경남',
+        '제주특별자치도':'제주',
+    };
 
     wrap.innerHTML = [
         /* 즐겨찾기 칩 (항상 첫 번째) */
         _showFavChip ? `<button class="region-chip fav-chip${activeFavOnly?' active':''}" data-fav="1" title="즐겨찾기한 단지만 보기">
             <span class="fav-chip-star">⭐</span><span class="fav-chip-text"> 즐겨찾기</span>
          </button>` : '',
-        /* 지역 칩 */
-        ...regions.map(r => {
-            const hideCls = MOBILE_MAIN.has(r) ? '' : ' mobile-hidden';
-            return `<button class="region-chip${r==='전체'&&!activeFavOnly?' active':''}${hideCls}" data-region="${r}">${r}</button>`;
+        /* 지역 칩 — 전국 시도 모두 표시, 가로 스크롤 */
+        ...ordered.map(r => {
+            const label = r === '전체' ? '전체' : (SHORT[r] || r);
+            return `<button class="region-chip${r==='전체'&&!activeFavOnly?' active':''}" data-region="${r}">${label}</button>`;
         })
     ].join('');
 
